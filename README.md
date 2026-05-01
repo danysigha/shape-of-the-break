@@ -5,6 +5,7 @@ providers using the 2023 CMS Medicare Physician & Other Practitioners dataset.
 Four statistical methods are applied: multiple linear regression (MLR),
 one-way ANOVA, logistic regression, and bootstrap/permutation tests.
 
+The full report is available in `docs/medicare_payment_gap_ma.pdf`.
 ---
 
 ## Data Source
