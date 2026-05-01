@@ -5,9 +5,6 @@ providers using the 2023 CMS Medicare Physician & Other Practitioners dataset.
 Four statistical methods are applied: multiple linear regression (MLR),
 one-way ANOVA, logistic regression, and bootstrap/permutation tests.
 
-Final project for INFO 6105: Data Science Engineering Methods and Tools,
-Northeastern University, Spring 2026.
-
 ---
 
 ## Data Source
