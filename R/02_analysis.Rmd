@@ -1,0 +1,2485 @@
+---
+title: "CMS Medicare Physician & Other Practitioners by Provider dataset for 2023 research questions"
+subtitle: "INFO 6105 Final Project"
+author: "Dany De Leriol Nohonet Sigha"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup-preprocessing, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+```{=html}
+<style>
+body { font-family: 'Palatino', 'Georgia', serif; }
+h1, h2 { color: #C8102E; }
+h3 { color: #444; }
+.try-it {
+  border: 2px solid #C8102E; padding: 12px; margin: 10px 0;
+  background-color: #fdf5f5; border-radius: 5px;
+}
+.why-box {
+  border-left: 5px solid #2166AC; padding: 10px 15px;
+  margin: 10px 0; background-color: #f0f6fc;
+}
+.pattern-box {
+  border: 2px solid #28A745; padding: 12px; margin: 10px 0;
+  background-color: #f0fff4; border-radius: 5px;
+}
+</style>
+```
+
+------------------------------------------------------------------------
+
+# Welcome
+
+This is the data mdeling step for the "Medicare Payment Gap Analysis in Massachussets" final project. 
+
+This file will answer the research questions (RQ):
+
+- RQ1: Perform multiple linear regression including coefficient interpretation (“holding all else constant”), 
+
+- RQ1: significance tests, R2 and adjusted R2, VIF for multicollinearity, and diagnostic plots (residuals vs. fitted, Q-Q plot, scale-location plot). Check LINE as-sumptions
+
+- RQ2: Perform One-Way ANOVA to compare payment gap means accross provider specialties
+
+- RQ2: State hypotheses, conduct F-test, create comparison plots, perform Tukey HSD post-hoc tests, check assumptions (normality, equal variances), and calculate effect size (η2)
+
+- RQ3: Model a binary outcome, the log-odds of being a high-gap provider.
+
+- RQ3: Report odds ratios with interpretations (“holding other variables constant”), confusion matrix with accuracy/sensitivity/specificity/precision, and ROC curve with AUC. Discuss threshold choice.
+
+- RQ4: Use bootstrap to construct a CI for the median payment gap between medical providers of high pct_dual and low_pct_dual. 
+
+- RQ4: Use a permutation test to test a hypothesis. Compare computational results to parametric results.
+
+**Dataset:** `MUP_PHY_R25_P05_V20_D23_Prov.csv` — 1,259,343 rows, each a provider--procedure--setting combination in 2023. Each row represents the aggregated activity for a specific provider performing a specific procedure (identified by HCPCS code) in a specific care setting (facility or non-facility) over the full 2023 reporting year, capturing totals such as number of times the service was rendered, number of unique beneficiaries who received it, total submitted charges, and total Medicare payments for that provider-procedure-setting combination.
+
+Missing values are absent across these key variables, including payment_gap, Tot_Sbmtd_Chrg, Tot_Mdcr_Stdzd_Amt, Tot_Benes, Tot_Srvcs, Rndrng_Prvdr_Type, Bene_Avg_Age, Bene_Avg_Risk_Scre. However, some chronic condition percentage variables are missing, and the Drug_Sbmtd_Chrg is sometimes absent.
+
+------------------------------------------------------------------------
+
+# Setup
+
+```{r preprocessing-setup}
+# Install if needed (uncomment once, then re-comment)
+
+library(tidyverse)
+library(haven)
+library(broom)
+library(car)
+library(pROC)
+library(boot)
+library(multcomp)
+library(rstatix)
+library(multcompView)
+library(parameters)
+library(quantreg)
+library(dunn.test)
+library(ggrepel)
+
+# Explicitly prefer dplyr functions over masked alternatives
+select    <- dplyr::select
+filter    <- dplyr::filter
+summarise <- dplyr::summarise
+
+theme_set(theme_minimal(base_size = 13))
+```
+
+------------------------------------------------------------------------
+
+# Part 1: Multiple Linear Regression (RQ1)
+
+::: fill-box
+**Research Question 1:** Do provider volume, patient risk profile, and chronic disease
+burden predict the standardized Medicare payment gap among Massachusetts providers, and
+which factors have the strongest independent effect holding all others constant?
+
+**Why multiple linear regression?** The outcome variable `log(payment_gap)` is
+continuous. MLR models the outcome as a linear combination of predictors, allowing each
+coefficient to be interpreted as the expected change in log payment gap for a one-unit
+increase in that predictor, holding all others constant. Exponentiated coefficients give
+multiplicative effects on the raw payment gap.
+
+**Two-model structure:** Model 1 uses the full dataset (n = 37,708) with risk score and
+age as the sole complexity controls, since `Bene_CC_*` variables are suppressed for 90%
+of providers. Model 2 uses the complete-CC subset (n = 3,752) and adds chronic condition
+variables selected by LASSO. The two models are complementary --- Model 1 establishes
+baseline drivers across all Massachusetts providers, Model 2 tests whether specific
+chronic condition burden adds explanatory power among high-volume providers where it can
+be reliably measured.
+
+**Predictors:**
+
+*Model 1 (full dataset):*
+- `Tot_Benes` — provider volume (practice size)
+- `srvcs_per_bene` — billing intensity (services per beneficiary)
+- `Bene_Avg_Age` — average beneficiary age
+- `Bene_Avg_Risk_Scre` — average HCC risk score (composite patient complexity)
+
+*Model 2 (complete-CC subset):*
+- All Model 1 predictors, plus LASSO-selected chronic condition variables:
+  `Bene_CC_PH_Hyperlipidemia_V2_Pct`, `Bene_CC_PH_Hypertension_V2_Pct`,
+  `Bene_CC_BH_PD_V1_Pct`, `Bene_CC_PH_Asthma_V2_Pct`,
+  `Bene_CC_BH_Mood_V2_Pct`, `Bene_CC_PH_Arthritis_V2_Pct`,
+  `Bene_CC_BH_Alz_NonAlzdem_V2_Pct`, `Bene_CC_BH_Alcohol_Drug_V1_Pct`,
+  `Bene_CC_PH_HF_NonIHD_V2_Pct`
+:::
+
+------------------------------------------------------------------------
+
+## Model 1: Full dataset
+
+```{r p1-model1-fit}
+ma_providers <- readRDS("../data/processed/ma_providers_preprocessed.rds")
+ma_providers_rq3 <- readRDS("../data/processed/ma_providers_rq3.rds")
+
+#model1 <- lm(
+#  log(payment_gap) ~ Tot_Benes + srvcs_per_bene + Bene_Avg_Age + Bene_Avg_Risk_Scre,
+#  data = ma_providers
+#)
+
+model1 <- lm(
+  log(payment_gap) ~ log(Tot_Benes) + log(srvcs_per_bene) + Bene_Avg_Age + Bene_Avg_Risk_Scre,
+  data = ma_providers
+)
+
+cat("── Model 1 Summary ──\n")
+summary(model1)
+
+
+```
+
+
+```{r p1-model1-tidy}
+cat("── Model 1 Coefficients (tidy) ──\n")
+tidy(model1, conf.int = TRUE) %>%
+  mutate(
+    exp_estimate = exp(estimate),
+    exp_conf.low  = exp(conf.low),
+    exp_conf.high = exp(conf.high)
+  ) %>%
+  print()
+```
+
+::: pattern-box
+**Interpreting Model 1 coefficients:**
+
+Coefficients are on the log scale. Exponentiating gives the multiplicative effect on the
+raw payment gap for a one-unit increase in each predictor. For example, if the coefficient
+for `srvcs_per_bene` is 0.15, then each additional service per beneficiary is associated
+with a payment gap that is $e^{0.15} \approx 1.16$ times larger — a 16% increase —
+holding all other predictors constant.
+:::
+
+```{r p1-model1-fit-stats}
+cat("── Model 1 R² and Adjusted R² ──\n")
+cat("R²:         ", round(summary(model1)$r.squared, 4), "\n")
+cat("Adjusted R²:", round(summary(model1)$adj.r.squared, 4), "\n")
+
+cat("\n── Model 1 VIF (multicollinearity check) ──\n")
+vif(model1)
+```
+
+::: why-box
+**Variance Inflation Factor (VIF):**
+
+VIF quantifies how much the variance of a coefficient is inflated due to collinearity
+with other predictors. A VIF above 5 indicates moderate multicollinearity and above 10
+indicates severe multicollinearity that may destabilize coefficient estimates. Because
+`Bene_Avg_Risk_Scre` is a composite that already incorporates chronic condition burden,
+mild correlation with `Bene_Avg_Age` is expected and acceptable.
+:::
+
+```{r p1-model1-diagnostics, fig.cap="Model 1 diagnostic plots. Residuals vs Fitted assesses linearity and homoscedasticity; Q-Q plot assesses normality of residuals; Scale-Location plot assesses equal variance; Residuals vs Leverage identifies influential observations."}
+par(mfrow = c(2, 2))
+plot(model1)
+par(mfrow = c(1, 1))
+```
+
+```{r p1-model1-cooks}
+cat("── Model 1 influential observations (Cook's distance > 4/n) ──\n")
+cooks_d <- cooks.distance(model1)
+threshold <- 4 / nrow(ma_providers)
+influential <- which(cooks_d > threshold)
+cat("Number of influential observations:", length(influential), "\n")
+cat("Proportion of dataset:", round(length(influential) / nrow(ma_providers) * 100, 1), "%\n")
+```
+
+::: why-box
+**Why complement Model 1 with quantile regression?**
+OLS regression estimates a single coefficient per predictor — the
+average effect across all 37,708 Massachusetts providers. This average
+is meaningful only if each predictor's effect is roughly uniform across
+the payment gap distribution. Three of four LINE assumptions are
+violated in Model 1, and the diagnostic plots show that residual spread
+is largest among low-volume providers and shrinks at high volume — a
+pattern consistent with heterogeneous predictor effects across the
+distribution.
+
+Quantile regression addresses this directly. Rather than targeting the
+conditional mean, it targets a specified quantile of the conditional
+outcome distribution — here the 25th, 50th, and 75th percentiles.
+This allows each predictor's coefficient to vary across the gap
+distribution, revealing whether billing intensity, patient complexity,
+or volume matter differently for low-gap versus high-gap providers.
+No distributional assumptions are required, making the approach robust
+to the heteroscedasticity and heavy tails documented above.
+
+The same four predictors as Model 1 are used:
+\texttt{log(Tot\_Benes)}, \texttt{log(srvcs\_per\_bene)},
+\texttt{Bene\_Avg\_Age}, and \texttt{Bene\_Avg\_Risk\_Scre}.
+Standard errors are estimated via the kernel method (\texttt{se = "ker"}),
+which is well suited for large continuous outcomes and avoids the
+instability of sandwich estimators at $n = 37{,}708$.
+:::
+
+```{r p1-model1-quantile}
+qr_model1 <- rq(
+  log(payment_gap) ~ log(Tot_Benes) + log(srvcs_per_bene) + Bene_Avg_Age + Bene_Avg_Risk_Scre,
+  tau  = c(0.25, 0.50, 0.75),
+  data = ma_providers
+)
+
+cat("── Quantile Regression Summary (Q25, Q50, Q75) ──\n")
+summary(qr_model1, se = "ker")
+```
+
+::: fill-box
+**Reading the quantile regression coefficient plot:**
+Each panel in the figure below shows one predictor. The x-axis indexes
+the quantile of the conditional payment gap distribution (Q25, Q50,
+Q75). The blue points are the quantile regression coefficient estimates
+at each quantile, with 95% confidence intervals shown as vertical bars.
+The orange dotted line is the OLS coefficient from Model 1 — the single
+average estimate. The orange shaded band is the OLS 95% confidence
+interval.
+
+**What to look for:**
+
+- If the blue points are flat and fall inside the orange band, OLS is
+  adequate for that predictor — its effect is uniform across the
+  distribution.
+- If the blue points trend upward from Q25 to Q75 and stray outside
+  the orange band, the predictor has a stronger effect on high-gap
+  providers than low-gap ones — OLS understates it at the top and
+  overstates it at the bottom.
+- If the blue points trend downward, the predictor matters more for
+  low-gap providers — OLS overstates its effect at the top of the
+  distribution.
+- A sign change across quantiles indicates the predictor has opposite
+  associations at different parts of the distribution.
+:::
+
+```{r p1-model1-quantile-plot}
+
+# Extract quantile regression coefficients at each tau
+qr_tidy <- bind_rows(
+  lapply(c(0.25, 0.50, 0.75), function(tau) {
+    fit <- rq(
+      log(payment_gap) ~ log(Tot_Benes) + log(srvcs_per_bene) +
+        Bene_Avg_Age + Bene_Avg_Risk_Scre,
+      tau  = tau,
+      data = ma_providers
+    )
+    s        <- summary(fit, se = "ker")
+    coef_mat <- s$coefficients
+    data.frame(
+      term     = rownames(coef_mat),
+      estimate = coef_mat[, "Value"],
+      se       = coef_mat[, "Std. Error"],
+      tau      = tau
+    )
+  })
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    lower     = estimate - 1.96 * se,
+    upper     = estimate + 1.96 * se,
+    tau_label = paste0("Q", tau * 100)
+  )
+
+# OLS reference
+ols_tidy <- tidy(model1, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  select(term, estimate, conf.low, conf.high)
+
+# Plot
+ggplot() +
+  # OLS CI shaded rectangle per facet
+  geom_rect(
+    data = ols_tidy,
+    aes(
+      xmin = 0.20,
+      xmax = 0.80,
+      ymin = conf.low,
+      ymax = conf.high
+    ),
+    fill  = "#E66101",
+    alpha = 0.15
+  ) +
+  # OLS point estimate dotted line
+  geom_hline(
+    data      = ols_tidy,
+    aes(yintercept = estimate),
+    colour    = "#E66101",
+    linetype  = "dotted",
+    linewidth = 0.8
+  ) +
+  # Quantile regression line
+  geom_line(
+    data      = qr_tidy,
+    aes(x = tau, y = estimate),
+    colour    = "#2166AC",
+    linewidth = 0.8
+  ) +
+  # Quantile regression points with CI
+  geom_pointrange(
+    data = qr_tidy,
+    aes(
+      x    = tau,
+      y    = estimate,
+      ymin = lower,
+      ymax = upper
+    ),
+    colour = "#2166AC",
+    size   = 0.5
+  ) +
+  facet_wrap(~ term, scales = "free_y", ncol = 2) +
+  scale_x_continuous(
+    breaks = c(0.25, 0.50, 0.75),
+    labels = c("Q25", "Q50", "Q75"),
+    limits = c(0.20, 0.80)
+  ) +
+  labs(
+    title    = "Quantile Regression Coefficients vs OLS — Model 1",
+    subtitle = "Orange band/line = OLS estimate and 95% CI; blue = quantile regression at Q25, Q50, Q75",
+    x        = "Quantile",
+    y        = "Coefficient estimate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40"),
+    strip.text    = element_text(size = 10, face = "bold")
+  )
+
+ggsave(
+  here::here("docs", "figures", "quantile_coef_model1.png"),
+  width = 9, height = 6, dpi = 300
+)
+```
+
+::: pattern-box
+**What the quantile regression reveals:**
+Four findings emerge that OLS cannot produce.
+
+**log(Tot\_Benes)** is the most stable predictor across quantiles
+(Q25: 0.990, Q50: 0.997, Q75: 0.997), but all three estimates lie
+above the OLS estimate of 0.971 and outside its confidence band.
+Volume affects all providers similarly regardless of where they sit
+in the gap distribution — but OLS slightly underestimates this effect.
+
+**log(srvcs\_per\_bene)** declines monotonically from 0.477 at Q25
+to 0.375 at Q75, with all three estimates outside the OLS band of
+0.417. Billing intensity is a stronger lever for low-gap providers
+than for high-gap ones. Among providers already at the top of the
+distribution, billing more intensively produces a smaller marginal
+increase in the gap than OLS predicts.
+
+**Bene\_Avg\_Risk\_Scre** shows the steepest cross-quantile gradient,
+declining from 0.311 at Q25 to 0.171 at Q75. Patient complexity drives
+the gap meaningfully among low-gap providers but contributes relatively
+little among high-gap ones — those providers appear to bill aggressively
+regardless of how sick their patient panels are.
+
+**Bene\_Avg\_Age** changes sign across quantiles, from positive at Q25
+(0.003) to negative at Q75 ($-$0.001), and is non-significant at Q75
+($p = 0.251$). This sign reversal confirms that age is not a stable
+predictor across the distribution, consistent with its non-significance
+in the OLS model.
+
+Taken together: the predictors that drive the gap among low-gap
+providers — billing intensity and patient complexity — lose explanatory
+power at the top of the distribution, where volume dominates. OLS was
+averaging across this heterogeneity and missing it entirely.
+:::
+
+------------------------------------------------------------------------
+
+## Model 2: Complete-CC subset
+
+```{r p1-model2-fit}
+ma_providers_cc <- ma_providers %>%
+  filter(!any_cc_missing)
+
+cc_predictors <- c(
+  "Bene_CC_PH_Hyperlipidemia_V2_Pct",
+  "Bene_CC_PH_Hypertension_V2_Pct",
+  "Bene_CC_BH_PD_V1_Pct",
+  "Bene_CC_PH_Asthma_V2_Pct",
+  "Bene_CC_PH_Arthritis_V2_Pct",
+  "Bene_CC_BH_Alz_NonAlzdem_V2_Pct",
+  "Bene_CC_BH_Alcohol_Drug_V1_Pct",
+  "Bene_CC_PH_HF_NonIHD_V2_Pct"
+)
+
+#model2_formula <- as.formula(
+#  paste(
+#    "log(payment_gap) ~ Tot_Benes + srvcs_per_bene + Bene_Avg_Age + Bene_Avg_Risk_Scre +",
+#    paste(cc_predictors, collapse = " + ")
+#  )
+#)
+
+model2_formula <- as.formula(
+  paste(
+    "log(payment_gap) ~ log(Tot_Benes) + log(srvcs_per_bene) + Bene_Avg_Age + Bene_Avg_Risk_Scre +",
+    paste(cc_predictors, collapse = " + ")
+  )
+)
+
+model2 <- lm(model2_formula, data = ma_providers_cc)
+
+cat("── Model 2 Summary ──\n")
+summary(model2)
+```
+
+```{r p1-model2-tidy}
+cat("── Model 2 Coefficients (tidy) ──\n")
+tidy(model2, conf.int = TRUE) %>%
+  mutate(
+    exp_estimate  = exp(estimate),
+    exp_conf.low  = exp(conf.low),
+    exp_conf.high = exp(conf.high)
+  ) %>%
+  print()
+```
+
+```{r p1-model2-fit-stats}
+cat("── Model 2 R² and Adjusted R² ──\n")
+cat("R²:         ", round(summary(model2)$r.squared, 4), "\n")
+cat("Adjusted R²:", round(summary(model2)$adj.r.squared, 4), "\n")
+
+cat("\n── Model 2 VIF (multicollinearity check) ──\n")
+vif(model2)
+```
+
+```{r p1-model2-diagnostics, fig.cap="Model 2 diagnostic plots for the complete-CC subset."}
+par(mfrow = c(2, 2))
+plot(model2)
+par(mfrow = c(1, 1))
+```
+
+```{r p1-model2-cooks}
+cat("── Model 2 influential observations (Cook's distance > 4/n) ──\n")
+cooks_d2 <- cooks.distance(model2)
+threshold2 <- 4 / nrow(ma_providers_cc)
+influential2 <- which(cooks_d2 > threshold2)
+cat("Number of influential observations:", length(influential2), "\n")
+cat("Proportion of dataset:", round(length(influential2) / nrow(ma_providers_cc) * 100, 1), "%\n")
+```
+
+::: why-box
+**Why extend Model 2 with quantile regression?**
+Model 2 already operates on a non-random subset of the Massachusetts
+provider population --- the 3,752 high-volume providers for whom CMS
+reports complete chronic condition data. These providers have a median
+payment gap of \$404,539, more than four times the full-population
+median of \$89,292. OLS estimates a single average effect for each of
+the 12 predictors within this already-elevated stratum, but that
+average may not represent any particular provider well if the effects
+are heterogeneous within the subset.
+
+The same LINE violations documented in Model 1 apply here, and the
+smaller sample size ($n = 3{,}752$) means the asymptotic defence is
+somewhat weaker. More importantly, the CC-complete subset has a
+substantively different composition from the full population --- it is
+dominated by high-volume procedural specialists whose billing behaviour
+may differ systematically from the median provider. If billing
+intensity or chronic condition effects operate differently among
+over-billers versus under-billers within this stratum, OLS will average
+across that heterogeneity and potentially misrepresent both groups.
+
+Quantile regression at Q25, Q50, and Q75 addresses this directly.
+Within the CC-complete subset, Q25 represents under-billers relative
+to their profile among high-volume providers, Q50 represents typical
+high-volume billers, and Q75 represents over-billers. Because the
+entire subset is already in the upper tier of the full gap distribution,
+these quantiles characterise heterogeneity within an elevated stratum
+--- a finer-grained view than Model 1 could provide.
+:::
+
+```{r p1-model2-quantile}
+
+qr_model2_formula <- as.formula(
+  paste(
+    "log(payment_gap) ~ log(Tot_Benes) + log(srvcs_per_bene) + Bene_Avg_Age + Bene_Avg_Risk_Scre +",
+    paste(cc_predictors, collapse = " + ")
+  )
+)
+
+qr_model2 <- rq(
+  qr_model2_formula,
+  tau  = c(0.25, 0.50, 0.75),
+  data = ma_providers_cc
+)
+
+cat("── Quantile Regression Summary Model 2 (Q25, Q50, Q75) ──\n")
+summary(qr_model2, se = "ker")
+```
+
+::: fill-box
+**Reading the Model 2 quantile coefficient plots:**
+Model 2 produces two coefficient plots --- one for the four base
+predictors shared with Model 1, and one for the eight LASSO-selected
+chronic condition predictors. Both follow the same visual logic as the
+Model 1 plot: blue points and lines show quantile regression estimates
+at Q25, Q50, and Q75 with 95\% confidence intervals; the orange dotted
+line is the OLS coefficient; the orange shaded band is the OLS 95\%
+confidence interval.
+
+**For the base predictors plot**, the comparison to Model 1 is
+informative. If the quantile patterns here differ from Model 1 ---
+for instance, if billing intensity now increases rather than decreases
+across quantiles --- that signals that the CC-complete subset is a
+genuinely different population where predictors operate differently,
+not just a smaller version of the full dataset.
+
+**For the chronic condition predictors plot**, look for two things.
+First, which conditions have stable effects across quantiles (points
+flat and inside the OLS band) versus heterogeneous effects (points
+trending up or down and straying outside the band). Stable conditions
+are reliable predictors for all high-volume providers; heterogeneous
+ones matter more for specific tiers. Second, pay attention to whether
+any conditions that appeared strong in OLS turn out to be concentrated
+at specific quantiles --- a large OLS coefficient driven entirely by
+Q25 or Q75 effects tells a very different policy story than one that
+is uniform across the distribution.
+:::
+
+```{r p1-model2-quantile-plot}
+
+# Helper to clean up term labels
+recode_terms <- function(x) {
+  case_when(
+    x == "log(Tot_Benes)"                   ~ "log(Tot_Benes)",
+    x == "log(srvcs_per_bene)"              ~ "log(srvcs_per_bene)",
+    x == "Bene_Avg_Age"                      ~ "Bene_Avg_Age",
+    x == "Bene_Avg_Risk_Scre"               ~ "Bene_Avg_Risk_Scre",
+    x == "Bene_CC_PH_Hyperlipidemia_V2_Pct" ~ "Hyperlipidemia",
+    x == "Bene_CC_PH_Hypertension_V2_Pct"   ~ "Hypertension",
+    x == "Bene_CC_BH_PD_V1_Pct"            ~ "Personality Disorder",
+    x == "Bene_CC_PH_Asthma_V2_Pct"        ~ "Asthma",
+    x == "Bene_CC_PH_Arthritis_V2_Pct"      ~ "Arthritis",
+    x == "Bene_CC_BH_Alz_NonAlzdem_V2_Pct" ~ "Dementia",
+    x == "Bene_CC_BH_Alcohol_Drug_V1_Pct"  ~ "Alcohol/Drug",
+    x == "Bene_CC_PH_HF_NonIHD_V2_Pct"     ~ "Heart Failure",
+    TRUE ~ x
+  )
+}
+
+qr_tidy2 <- bind_rows(
+  lapply(c(0.25, 0.50, 0.75), function(tau) {
+    fit <- rq(
+      qr_model2_formula,
+      tau  = tau,
+      data = ma_providers_cc
+    )
+    s        <- summary(fit, se = "ker")
+    coef_mat <- s$coefficients
+    data.frame(
+      term     = rownames(coef_mat),
+      estimate = coef_mat[, "Value"],
+      se       = coef_mat[, "Std. Error"],
+      tau      = tau
+    )
+  })
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    lower     = estimate - 1.96 * se,
+    upper     = estimate + 1.96 * se,
+    tau_label = paste0("Q", tau * 100),
+    term      = recode_terms(term)
+  )
+
+# OLS reference from model2
+ols_tidy2 <- tidy(model2, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = recode_terms(term)) %>%
+  select(term, estimate, conf.low, conf.high)
+
+# Split into base and CC predictors
+base_terms <- c("log(Tot_Benes)", "log(srvcs_per_bene)",
+                 "Bene_Avg_Age", "Bene_Avg_Risk_Scre")
+
+cc_terms <- c("Hyperlipidemia", "Hypertension", "Personality Disorder",
+               "Asthma", "Arthritis", "Dementia", "Alcohol/Drug", "Heart Failure")
+
+plot_qr <- function(tidy_qr, tidy_ols, terms, title_suffix) {
+  ggplot() +
+    geom_rect(
+      data = tidy_ols %>% filter(term %in% terms),
+      aes(
+        xmin = 0.20, xmax = 0.80,
+        ymin = conf.low, ymax = conf.high
+      ),
+      fill  = "#E66101",
+      alpha = 0.15
+    ) +
+    geom_hline(
+      data      = tidy_ols %>% filter(term %in% terms),
+      aes(yintercept = estimate),
+      colour    = "#E66101",
+      linetype  = "dotted",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data      = tidy_qr %>% filter(term %in% terms),
+      aes(x = tau, y = estimate),
+      colour    = "#2166AC",
+      linewidth = 0.8
+    ) +
+    geom_pointrange(
+      data = tidy_qr %>% filter(term %in% terms),
+      aes(x = tau, y = estimate, ymin = lower, ymax = upper),
+      colour = "#2166AC",
+      size   = 0.5
+    ) +
+    facet_wrap(~ term, scales = "free_y", ncol = 2) +
+    scale_x_continuous(
+      breaks = c(0.25, 0.50, 0.75),
+      labels = c("Q25", "Q50", "Q75"),
+      limits = c(0.20, 0.80)
+    ) +
+    labs(
+      title    = paste("Quantile Regression Coefficients vs OLS — Model 2,", title_suffix),
+      subtitle = "Orange band/line = OLS estimate and 95% CI; blue = quantile regression at Q25, Q50, Q75",
+      x        = "Quantile",
+      y        = "Coefficient estimate"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title    = element_text(size = 13),
+      plot.subtitle = element_text(size = 10, colour = "grey40"),
+      strip.text    = element_text(size = 10, face = "bold")
+    )
+}
+
+p_base <- plot_qr(qr_tidy2, ols_tidy2, base_terms, "Base Predictors")
+p_cc   <- plot_qr(qr_tidy2, ols_tidy2, cc_terms,   "Chronic Condition Predictors")
+
+print(p_base)
+print(p_cc)
+
+ggsave(
+  here::here("docs", "figures", "quantile_coef_model2_base.png"),
+  plot  = p_base,
+  width = 9, height = 6, dpi = 300
+)
+
+ggsave(
+  here::here("docs", "figures", "quantile_coef_model2_cc.png"),
+  plot  = p_cc,
+  width = 9, height = 6, dpi = 300
+)
+```
+::: pattern-box
+**What the Model 2 quantile regression reveals:**
+
+**Base predictors --- two key reversals from Model 1:**
+
+**log(Tot\_Benes)** is flat across quantiles (Q25: 0.441, Q50: 0.420,
+Q75: 0.462) but lies below the OLS estimate of 0.555 at all three
+points, outside the OLS confidence band. Within the CC-complete
+high-volume subset, OLS overestimates the volume effect. Volume has
+already done much of its work by selecting providers into this
+high-gap stratum; within-stratum variation in volume carries less
+marginal explanatory power than OLS suggests.
+
+**log(srvcs\_per\_bene)** reverses the Model 1 pattern, increasing
+from 0.444 at Q25 to 0.580 at Q75, with Q75 outside the OLS band.
+In Model 1, billing intensity mattered more for low-gap providers.
+Here, within the high-volume subset, it matters more for over-billers.
+This reversal is substantively important: aggressive billing intensity
+is a distinguishing characteristic of over-billers specifically within
+this stratum.
+
+**Bene\_Avg\_Risk\_Scre** declines sharply from 0.297 at Q25 to 0.032
+at Q75 (non-significant, $p = 0.548$). Among over-billers in this
+high-volume subset, patient complexity adds almost nothing to the gap
+once chronic condition mix is controlled for.
+
+**Chronic condition predictors --- three findings worth highlighting:**
+
+**Dementia** is the most consistent predictor across all quantiles
+($-$0.021, $-$0.021, $-$0.018), all within the OLS band and all
+significant. The gap-reducing effect of dementia prevalence is uniform
+within this subset --- it applies equally to under-billers, typical
+providers, and over-billers.
+
+**Hypertension** shows an unexpected V-shape: 0.037 at Q25, dropping
+to near zero at Q50 (0.009, non-significant), then recovering to 0.021
+at Q75. The OLS coefficient of 0.052 --- the largest positive chronic
+condition effect in the paper --- was masking this instability. The
+hypertension effect is concentrated at the extremes of the distribution
+and essentially absent for typical high-volume providers. This
+substantially qualifies the headline OLS finding.
+
+**Hyperlipidemia** declines from 0.048 at Q25 to 0.020 at Q75, with
+Q25 above the OLS band. Its positive effect is concentrated among
+under-billers within this stratum and attenuates for over-billers.
+
+**Alcohol/Drug**, **Heart Failure**, and **Asthma** are broadly
+consistent with OLS estimates and stable across quantiles.
+**Personality Disorder** and **Arthritis** show modest attenuation
+at higher quantiles but remain within their OLS confidence bands.
+:::
+
+------------------------------------------------------------------------
+
+## Model comparison
+
+```{r p1-model-comparison}
+cat("── Model 1 vs Model 2 comparison ──\n")
+bind_rows(
+  glance(model1) %>% mutate(model = "Model 1 (full, n = 37,708)"),
+  glance(model2) %>% mutate(model = "Model 2 (complete-CC, n = 3,752)")
+) %>%
+  dplyr::select(model, r.squared, adj.r.squared, AIC, BIC, statistic, p.value) %>%
+  print()
+```
+::: why-box
+**Why check coefficient stability after removing influential
+observations?**
+Cook's distance flags observations that have disproportionate
+influence on the OLS coefficient estimates. Model 1 identifies
+1,899 such observations (5.0\% of the dataset) using the
+conventional threshold of $4/n$. These are providers whose
+combination of predictor values and payment gap makes them
+outliers relative to the fitted model.
+
+The presence of influential observations is not itself a problem
+--- large datasets always contain some. The question is whether
+the coefficient estimates change materially when these observations
+are excluded. If the estimates are stable, the findings are robust
+and the influential observations are not driving the results. If
+they change substantially, that signals that the OLS estimates
+are sensitive to a small number of extreme providers, which would
+be an important qualification of the main findings.
+
+Model 1 is therefore refit on the 35,809 providers remaining
+after removing the 1,899 influential observations, and the
+coefficients are compared directly.
+:::
+
+::: fill-box
+**Reading the Cook's distance robustness plot:**
+Each panel shows one predictor. The left point in each panel is
+the coefficient estimate from the full Model 1 ($n = 37{,}708$);
+the right point is the coefficient from the model refit after
+removing influential observations ($n = 35{,}809$). Vertical
+bars show 95\% confidence intervals.
+
+**What to look for:** if the two points in each panel overlap
+or are very close relative to their confidence intervals, the
+coefficient is stable --- the influential observations are not
+driving that finding. If the points are far apart and their
+confidence intervals do not overlap, the finding is sensitive
+to the influential observations and should be interpreted with
+more caution.
+
+The R² comparison is also informative. An increase in R² after
+removing influential observations indicates that those
+observations were poorly fitted outliers pulling the model fit
+down. A decrease would indicate the influential observations
+were well-fitted high-leverage points helping the model.
+:::
+
+```{r p1-model1-cooks-robustness}
+# Identify influential observations
+cooks_d    <- cooks.distance(model1)
+threshold  <- 4 / nrow(ma_providers)
+influential_idx <- which(cooks_d > threshold)
+
+cat("── Model 1 refitted without influential observations ──\n")
+cat("Removing", length(influential_idx), "influential observations\n")
+cat("Remaining n:", nrow(ma_providers) - length(influential_idx), "\n\n")
+
+# Refit without influential observations
+ma_providers_clean <- ma_providers[-influential_idx, ]
+
+model1_clean <- lm(
+  log(payment_gap) ~ log(Tot_Benes) + log(srvcs_per_bene) +
+    Bene_Avg_Age + Bene_Avg_Risk_Scre,
+  data = ma_providers_clean
+)
+
+cat("── Coefficient comparison: full vs cleaned dataset ──\n")
+bind_rows(
+  tidy(model1) %>%
+    mutate(dataset = "Full (n = 37,708)"),
+  tidy(model1_clean) %>%
+    mutate(dataset = paste0("Cleaned (n = ",
+                            nrow(ma_providers_clean), ")"))
+) %>%
+  filter(term != "(Intercept)") %>%
+  select(dataset, term, estimate, std.error, p.value) %>%
+  mutate(across(c(estimate, std.error), ~round(., 4))) %>%
+  mutate(p.value = round(p.value, 6)) %>%
+  arrange(term, dataset) %>%
+  print(n = Inf)
+
+cat("\n── R² comparison ──\n")
+cat("Full model R²:   ", round(summary(model1)$r.squared, 4), "\n")
+cat("Cleaned model R²:", round(summary(model1_clean)$r.squared, 4), "\n")
+```
+
+```{r p1-model1-cooks-robustness-plot}
+
+# Pre-compute label strings to avoid paste0 inside aes/scale calls
+label_full    <- "Full dataset\n(n = 37,708)"
+label_cleaned <- paste0("Influential obs. removed\n(n = ",
+                         nrow(ma_providers_clean), ")")
+
+coef_comparison <- bind_rows(
+  tidy(model1, conf.int = TRUE) %>%
+    mutate(dataset = label_full),
+  tidy(model1_clean, conf.int = TRUE) %>%
+    mutate(dataset = label_cleaned)
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = case_when(
+      term == "log(Tot_Benes)"      ~ "log(Tot_Benes)",
+      term == "log(srvcs_per_bene)" ~ "log(srvcs_per_bene)",
+      term == "Bene_Avg_Age"        ~ "Bene_Avg_Age",
+      term == "Bene_Avg_Risk_Scre"  ~ "Bene_Avg_Risk_Scre",
+      TRUE ~ term
+    )
+  )
+
+ggplot(coef_comparison,
+       aes(x = dataset, y = estimate,
+           ymin = conf.low, ymax = conf.high,
+           colour = dataset)) +
+  geom_pointrange(size = 0.6) +
+  facet_wrap(~ term, scales = "free_y", ncol = 2) +
+  scale_colour_manual(
+  values = setNames(
+      c("#2166AC", "#C8102E"),
+      c(label_full, label_cleaned)
+    ),
+    guide = "none"
+  ) +
+  labs(
+    title    = "Model 1 Coefficient Stability — Cook's Distance Robustness Check",
+    subtitle = "Blue = full dataset; Red = influential observations removed (Cook's D > 4/n)",
+    x        = NULL,
+    y        = "Coefficient estimate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40"),
+    strip.text    = element_text(size = 10, face = "bold")
+  )
+
+ggsave(
+  here::here("docs", "figures", "cooks_robustness_model1.png"),
+  width = 8, height = 5, dpi = 300
+)
+```
+
+::: pattern-box
+**What the robustness check reveals:**
+R² increases from 0.629 to 0.738 after removing the 1,899
+influential observations, confirming that these providers were
+poorly fitted outliers rather than high-leverage points
+supporting the model fit. Their removal improves fit
+substantially.
+
+**\texttt{log(Tot\_Benes)}}** is the most stable predictor:
+0.971 in the full model versus 0.998 in the cleaned model,
+with overlapping confidence intervals. The dominant finding
+--- that provider volume is the strongest predictor of the
+payment gap --- does not depend on influential observations.
+
+**\texttt{log(srvcs\_per\_bene)}}** is equally stable: 0.417
+versus 0.406, a negligible difference.
+
+**\texttt{Bene\_Avg\_Risk\_Scre}** shows the most meaningful
+shift: 0.312 in the full model versus 0.256 in the cleaned
+model, an 18\% attenuation. The risk score effect is partially
+inflated by the influential observations. It remains
+significant and in the same direction, but its magnitude
+should be interpreted with some caution.
+
+**\texttt{Bene\_Avg\_Age}** shows a substantively interesting
+change: non-significant in the full model ($p = 0.213$) but
+significant in the cleaned model (0.0023, $p = 0.002$). The
+influential observations were suppressing the age effect.
+This further supports its retention in the model --- its
+non-significance in the full dataset reflects the distorting
+influence of outliers rather than a genuine absence of effect.
+
+Overall the robustness check confirms that the core Model 1
+findings are not driven by influential observations. The one
+qualification worth noting is that the patient complexity
+effect (\texttt{Bene\_Avg\_Risk\_Scre}) is modestly inflated
+in the full dataset, consistent with the quantile regression
+finding that this predictor attenuates at higher quantiles
+where extreme providers are more prevalent.
+:::
+------------------------------------------------------------------------
+
+# Part 2: One-Way ANOVA (RQ2)
+
+::: fill-box
+**Research Question 2:** Do average standardized Medicare payment gaps differ
+significantly across provider specialties in Massachusetts, and which specific
+specialties drive the largest gaps?
+
+**Why one-way ANOVA?** The outcome variable `log(payment_gap)` is continuous and
+the grouping variable `Rndrng_Prvdr_Type` is categorical with multiple levels. ANOVA
+tests whether the group means differ simultaneously rather than through a series of
+pairwise comparisons, which would inflate the Type I error rate. The analysis is
+restricted to the top 10 specialties by provider count to ensure adequate group sizes
+for assumption checking and post-hoc inference.
+
+**Hypotheses:**
+
+$H_0$: The mean log payment gap is equal across all ten specialty groups.
+
+$H_1$: At least one specialty group has a different mean log payment gap.
+:::
+
+```{r p2-setup}
+
+top10_specialties <- ma_providers %>%
+  count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+  head(10) %>%
+  pull(Rndrng_Prvdr_Type)
+
+ma_top10 <- ma_providers %>%
+  filter(Rndrng_Prvdr_Type %in% top10_specialties) %>%
+  mutate(Rndrng_Prvdr_Type = factor(Rndrng_Prvdr_Type))
+```
+
+------------------------------------------------------------------------
+
+## Step 1: Assumption checks
+
+::: why-box
+**Why check assumptions before running ANOVA?**
+
+Standard one-way ANOVA assumes (1) independence of observations, (2) normality of
+residuals within each group, and (3) homogeneity of variance across groups. With
+group sizes ranging from 1,033 to 5,496, the Central Limit Theorem ensures the
+normality assumption is met asymptotically. The equal variance assumption is the
+critical one to verify, as the boxplot already suggests substantially different
+within-group spreads across specialties.
+:::
+
+```{r p2-levene}
+cat("── Levene's Test for Homogeneity of Variance ──\n")
+leveneTest(log(payment_gap) ~ Rndrng_Prvdr_Type, data = ma_top10)
+```
+
+::: pattern-box
+**Interpretation:** Levene's test returns $F(9, 21{,}743) = 110.08$,
+$p < 2.2 \times 10^{-16}$. The equal variance assumption is decisively violated.
+Standard one-way ANOVA is therefore not appropriate; Welch's ANOVA is used instead,
+as it does not assume homogeneity of variance across groups.
+:::
+
+------------------------------------------------------------------------
+
+## Step 2: Normality check
+
+::: why-box
+**Why check normality?**
+
+One-way ANOVA assumes that residuals within each group are approximately normally
+distributed. With group sizes ranging from 1,033 to 5,496, the Central Limit Theorem
+guarantees that the sampling distribution of group means is approximately normal
+regardless of the underlying distribution, making the F-test asymptotically valid.
+Shapiro-Wilk is nonetheless run on a random sample of residuals per group for
+completeness. At these sample sizes, the test has sufficient power to detect trivially
+small deviations from normality, so a significant result does not necessarily indicate
+a practically meaningful violation.
+:::
+
+```{r p2-normality}
+cat("── Shapiro-Wilk normality test per specialty group (sample of 500) ──\n")
+ma_top10 %>%
+  mutate(log_gap = log(payment_gap)) %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    n        = n(),
+    sw_stat  = shapiro.test(sample(log_gap, min(500, n())))$statistic,
+    sw_p     = shapiro.test(sample(log_gap, min(500, n())))$p.value,
+    .groups  = "drop"
+  ) %>%
+  mutate(across(c(sw_stat, sw_p), ~round(., 4))) %>%
+  arrange(sw_p) %>%
+  print()
+```
+
+------------------------------------------------------------------------
+
+## Step 3: Welch's ANOVA
+
+::: why-box
+**Why Welch's ANOVA instead of standard ANOVA?**
+
+Standard one-way ANOVA pools the within-group variance into a single estimate,
+which is unreliable when group variances differ substantially. Welch's ANOVA
+estimates each group's variance separately, producing an F-statistic that is robust
+to heteroscedasticity. The tradeoff is a reduction in degrees of freedom via the
+Welch-Satterthwaite approximation, which makes the test slightly more conservative.
+:::
+
+```{r p2-welch-anova}
+cat("── Welch's One-Way ANOVA ──\n")
+welch_result <- oneway.test(
+  log(payment_gap) ~ Rndrng_Prvdr_Type,
+  data      = ma_top10,
+  var.equal = FALSE
+)
+print(welch_result)
+
+cat("\n── Classic ANOVA Table (for eta-squared and display) ──\n")
+anova_classic <- aov(log(payment_gap) ~ Rndrng_Prvdr_Type, data = ma_top10)
+summary(anova_classic)
+```
+
+------------------------------------------------------------------------
+
+## Step 3: Effect size
+
+::: why-box
+**Why report effect size?**
+
+A statistically significant F-test only indicates that at least one group mean
+differs — it says nothing about the magnitude of the difference. Eta-squared
+($\eta^2$) quantifies the proportion of total variance in log payment gap explained
+by specialty group membership, providing a scale-independent measure of practical
+significance. By convention, $\eta^2 = 0.01$ is small, $0.06$ is medium, and
+$0.14$ is large.
+:::
+
+```{r p2-effect-size}
+cat("── Effect size (eta-squared) ──\n")
+anova_classic <- aov(log(payment_gap) ~ Rndrng_Prvdr_Type, data = ma_top10)
+eta_sq <- sum(summary(anova_classic)[[1]]["Sum Sq"][1, ]) /
+          sum(summary(anova_classic)[[1]]["Sum Sq"])
+cat("Eta-squared:", round(eta_sq, 4), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Step 4: Post-hoc pairwise comparisons
+
+::: why-box
+**Why Games-Howell instead of Tukey HSD?**
+
+Tukey's HSD assumes equal group variances, which Levene's test has rejected.
+Games-Howell is the appropriate post-hoc procedure when variances are unequal: it
+uses group-specific variance estimates and applies the Welch-Satterthwaite
+approximation to degrees of freedom, controlling the familywise error rate without
+assuming homoscedasticity.
+:::
+
+```{r p2-games-howell}
+cat("── Games-Howell Post-Hoc Pairwise Comparisons ──\n")
+gh_result <- ma_top10 %>%
+  mutate(log_gap = log(payment_gap)) %>%
+  games_howell_test(log_gap ~ Rndrng_Prvdr_Type) %>%
+  arrange(p.adj) %>%
+  print(n = Inf)
+```
+
+```{r p2-games-howell-sig}
+cat("── Significant pairwise differences (p.adj < 0.05) ──\n")
+gh_result %>%
+  filter(p.adj < 0.05) %>%
+  arrange(p.adj) %>%
+  print(n = Inf)
+
+cat("\n── Non-significant pairwise differences (p.adj >= 0.05) ──\n")
+gh_result %>%
+  filter(p.adj >= 0.05) %>%
+  print(n = Inf)
+```
+
+```{r p2-cld}
+
+cat("── Compact Letter Display ──\n")
+# Extract p-values into named vector for multcompLetters
+gh_wide <- gh_result %>%
+  mutate(pair = paste(group1, group2, sep = "-")) %>%
+  select(pair, p.adj)
+
+p_vec <- setNames(gh_wide$p.adj, gh_wide$pair)
+cld <- multcompLetters(p_vec)
+print(cld)
+
+# Tidy version joined to group means
+cld_df <- data.frame(
+  Rndrng_Prvdr_Type = names(cld$Letters),
+  cld_letter        = cld$Letters
+)
+
+ma_top10 %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(mean_log = round(mean(log(payment_gap)), 3), .groups = "drop") %>%
+  left_join(cld_df, by = "Rndrng_Prvdr_Type") %>%
+  arrange(desc(mean_log)) %>%
+  print()
+```
+
+::: why-box
+**Why complement Welch's ANOVA with Kruskal-Wallis and Dunn's test?**
+Welch's ANOVA and Games--Howell post-hoc tests are robust to unequal
+variances --- the primary assumption violation identified by Levene's
+test --- but both remain parametric procedures that model the
+relationship between group means. The payment gap distribution within
+each specialty is heavily right-skewed and heavy-tailed, meaning that
+specialty-level means summarise skewed distributions rather than
+symmetric ones. While the Central Limit Theorem ensures the F-test is
+asymptotically valid at group sizes of 1,033--5,496, the concern is
+not inferential validity but representativeness: do the mean-based
+comparisons reflect what is actually happening in the bulk of each
+specialty's distribution?
+
+Kruskal-Wallis with Dunn's post-hoc test addresses this by operating
+on ranks rather than raw values. It asks whether the \textit{distributions}
+of payment gaps differ across specialties rather than whether the means
+differ, making no assumptions about the shape of those distributions.
+Dunn's test then performs pairwise comparisons on the same ranks with
+Bonferroni correction for multiple comparisons.
+
+If the two approaches agree --- the same specialty pairs emerge as
+significantly different under both parametric and non-parametric
+testing --- that convergence substantially strengthens confidence in
+the RQ2 findings. If they disagree, that flags pairs where the
+mean-based result may be driven by distributional shape rather than
+a genuine location difference.
+:::
+
+::: fill-box
+**Kruskal-Wallis and Dunn's test: what they do**
+
+The Kruskal-Wallis test is the non-parametric equivalent of one-way
+ANOVA. All observations across all groups are ranked from smallest to
+largest, and the test asks whether the average ranks differ
+significantly across specialty groups. Under the null hypothesis that
+all specialties have the same payment gap distribution, the average
+ranks should be roughly equal. A significant result indicates that at
+least one specialty's distribution is shifted relative to the others.
+
+Dunn's test then performs all 45 pairwise comparisons using those same
+ranks. Bonferroni correction is applied to control the familywise
+error rate across 45 simultaneous tests --- the same multiple
+comparison concern that motivated Games--Howell in the parametric
+analysis. A pair flagged as significant under Dunn's test has a
+rank-based distribution difference that is unlikely to be due to
+chance after correction.
+
+**What to look for:** the non-significant pairs from Games--Howell
+--- Family Practice vs.\ Physical Therapist and Family Practice vs.\
+Physician Assistant --- should remain non-significant under Dunn's
+test if the parametric and non-parametric approaches are telling the
+same story. Any new non-significant pairs under Dunn's test, or any
+pairs that flip from non-significant to significant, would indicate
+that the mean-based result was sensitive to distributional shape.
+:::
+
+```{r p2-kruskal-wallis}
+cat("── Kruskal-Wallis Test ──\n")
+kw_result <- kruskal.test(
+  payment_gap ~ Rndrng_Prvdr_Type,
+  data = ma_top10
+)
+print(kw_result)
+
+cat("\n── Dunn's Post-Hoc Test (Bonferroni correction) ──\n")
+dunn_result <- dunn.test(
+  x     = ma_top10$payment_gap,
+  g     = ma_top10$Rndrng_Prvdr_Type,
+  method = "bonferroni",
+  alph   = 0.05,
+  kw     = FALSE,
+  label  = TRUE,
+  wrap   = FALSE
+)
+```
+
+```{r p2-kruskal-comparison}
+# Tidy Dunn results and compare to Games-Howell
+dunn_df <- data.frame(
+  comparison = dunn_result$comparisons,
+  p_adj      = dunn_result$P.adjusted
+) %>%
+  mutate(
+    sig_dunn = p_adj < 0.05
+  ) %>%
+  arrange(p_adj)
+
+cat("── Non-significant pairs under Dunn's test ──\n")
+dunn_df %>%
+  filter(!sig_dunn) %>%
+  print()
+
+cat("\n── Significant pairs: Dunn's test ──\n")
+cat("Significant pairs:", sum(dunn_df$sig_dunn), "of", nrow(dunn_df), "\n")
+
+cat("\n── Convergence check: Welch ANOVA vs Kruskal-Wallis ──\n")
+cat("Welch's ANOVA p-value:    < 2.2e-16\n")
+cat("Kruskal-Wallis p-value:  ", format(kw_result$p.value, scientific = TRUE), "\n")
+cat("\nIf both reject H0 and non-significant pairs agree,\n")
+cat("parametric and non-parametric approaches converge.\n")
+```
+
+::: pattern-box
+**What the convergence check reveals:**
+The Kruskal-Wallis test decisively rejects the null hypothesis that
+payment gap distributions are equal across all ten specialties
+($\chi^2(9) = 5285$, $p < 2.2 \times 10^{-16}$), consistent with
+Welch's ANOVA ($F(9, 6{,}181.8) = 929.99$, $p < 2.2 \times 10^{-16}$).
+The omnibus results from both approaches are in complete agreement.
+
+Dunn's post-hoc tests with Bonferroni correction find 42 of 45 pairs
+significantly different, compared to 43 of 45 under Games--Howell.
+The two approaches agree on the core middle-tier finding: Family
+Practice vs.\ Physical Therapist remains non-significant under both
+methods. Two additional pairs are non-significant under Dunn's test
+but significant under Games--Howell: Physical Therapist vs.\
+Physician Assistant, and Anesthesiology vs.\ Diagnostic Radiology.
+
+The Physical Therapist vs.\ Physician Assistant pair is
+unsurprising given their similar medians (\$64,477 vs.\ \$57,653);
+the rank-based test simply applies a more conservative criterion
+than the mean-based one. The Anesthesiology vs.\ Diagnostic Radiology
+discrepancy is more substantive: Games--Howell detects a difference
+in means (\$266k vs.\ \$359k) that Dunn's test does not confirm at
+the distributional level, suggesting the mean difference between
+these two high-gap specialties is partly driven by the extreme right
+tail of Diagnostic Radiology rather than a systematic shift in the
+bulk of the distribution.
+
+Overall the two approaches converge on the same structural picture:
+a clear high-gap tier (Diagnostic Radiology, Anesthesiology, Emergency
+Medicine), a low-gap tier (Licensed Clinical Social Worker, Psychiatry),
+and a middle cluster whose internal boundaries are sensitive to whether
+mean-based or rank-based comparisons are used. The core specialty
+ranking is robust; the precise boundaries within the middle tier are not.
+:::
+------------------------------------------------------------------------
+
+## Step 5: Group means plot
+
+```{r p2-means-plot, fig.cap="Mean log payment gap with 95% confidence intervals by provider specialty. Specialties are ordered by mean log payment gap. Error bars reflect within-group standard error."}
+ma_top10 %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    mean_log = mean(log(payment_gap)),
+    se_log   = sd(log(payment_gap)) / sqrt(n()),
+    .groups  = "drop"
+  ) %>%
+  ggplot(aes(
+    x    = reorder(Rndrng_Prvdr_Type, mean_log),
+    y    = mean_log,
+    ymin = mean_log - 1.96 * se_log,
+    ymax = mean_log + 1.96 * se_log
+  )) +
+  geom_pointrange(colour = "#2166AC", size = 0.7) +
+  coord_flip() +
+  labs(
+    title    = "Mean Log Payment Gap by Provider Specialty",
+    subtitle = "Massachusetts Medicare Providers, 2023 — Top 10 specialties by count",
+    x        = NULL,
+    y        = "Mean log(Payment Gap $)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10)
+  )
+
+ggsave(
+  here::here("docs", "figures", "specialty_means.png"),
+  width = 7, height = 5, dpi = 300
+)
+```
+
+```{r p2-significance}
+gh_result %>%
+  filter(p.adj >= 0.05) %>%
+  nrow()
+
+gh_result %>%
+  filter(p.adj >= 0.05) %>%
+  select(group1, group2, estimate, p.adj)
+```
+
+::: why-box
+**Why visualize all 97 specialties rather than just the top 10?**
+The formal ANOVA is restricted to the top 10 specialties by provider
+count to ensure adequate group sizes for reliable inference. This is
+a principled analytical choice, but it raises a legitimate question:
+do the 87 excluded specialties exhibit more extreme payment gaps than
+those analyzed? If so, the ANOVA findings characterize only a subset
+of the specialty landscape and the true upper end of the gap
+distribution is underrepresented.
+
+This visualization addresses that question directly by computing the
+median payment gap for all 97 Massachusetts provider specialties and
+ranking them from highest to lowest. No formal inference is performed
+on the excluded specialties --- their group sizes range from 1 to 564
+and many are too small for reliable Welch's ANOVA inference. The goal
+is descriptive: to place the ANOVA findings in the context of the full
+specialty landscape and identify whether any excluded specialties
+occupy dramatically different positions in the gap distribution.
+
+Two plots are presented. The first uses a log scale to show all 97
+specialties simultaneously, revealing the full shape of the
+distribution including facility and equipment-based outliers. The
+second zooms into the individual provider range (median gap below
+\$1M) where the ANOVA specialties are visible alongside the excluded
+individual-type providers.
+:::
+
+::: fill-box
+**Reading the full-spectrum specialty plots:**
+
+**Log scale plot:** each point is one specialty. The y-axis is
+logarithmic, meaning equal vertical distances represent equal
+multiplicative differences rather than equal dollar differences.
+Red points are the 10 specialties included in the formal ANOVA;
+grey points are the 87 excluded specialties. The dashed horizontal
+line marks the Massachusetts provider median (\$89,292). Points
+above this line have above-median gaps; points below have
+below-median gaps. The smooth decay from left to right shows how
+the gap distribution tapers across the full specialty landscape.
+
+**Zoomed plot:** the same data filtered to specialties with median
+gaps below \$1M, which removes the facility and equipment-based
+outliers and makes the individual provider structure visible. Blue
+labels identify excluded specialties that rank above the highest
+ANOVA specialty (Diagnostic Radiology, \$358,812). Any grey points
+sitting above the leftmost red point (Diagnostic Radiology) are
+specialties whose median gaps exceed the top ANOVA specialty despite
+being excluded from formal testing due to low provider counts.
+
+**What to look for:** how many excluded specialties rank above
+Diagnostic Radiology, what types of specialties they are, and
+whether their presence changes the interpretation of the ANOVA
+findings about which specialties drive the largest gaps.
+:::
+
+```{r p2-all-specialties-ranked, fig.cap="Median payment gap for all 97 Massachusetts provider specialties, ranked from highest to lowest. Red points indicate the top 10 specialties by provider count included in the formal ANOVA. Grey points show the 87 excluded specialties. Dashed line marks the Massachusetts provider median ($89,292)."}
+
+library(ggrepel)
+
+# Compute median gap and provider count for all 97 specialties
+all_specialties <- ma_providers %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    n          = n(),
+    median_gap = median(payment_gap),
+    mean_gap   = mean(payment_gap),
+    p25_gap    = quantile(payment_gap, 0.25),
+    p75_gap    = quantile(payment_gap, 0.75),
+    .groups    = "drop"
+  ) %>%
+  arrange(desc(median_gap)) %>%
+  mutate(
+    rank        = row_number(),
+    n_ranks     = n(),
+    in_top10    = Rndrng_Prvdr_Type %in% top10_specialties,
+    is_facility = rank <= 5 & !in_top10,
+    is_bottom_interesting = Rndrng_Prvdr_Type %in% c(
+      "Mass Immunizer Roster Biller",
+      "Centralized Flu",
+      "Registered Dietitian or Nutrition Professional",
+      "Certified Nurse Midwife"
+    )
+  )
+
+# Print bottom 10 for inspection
+cat("── Bottom 10 specialties by median payment gap (all 97) ──\n")
+all_specialties %>%
+  arrange(median_gap) %>%
+  select(rank, Rndrng_Prvdr_Type, n, median_gap) %>%
+  head(10) %>%
+  mutate(median_gap = scales::dollar(round(median_gap, 0))) %>%
+  print()
+
+# ── Plot 1: Log scale — full picture ─────────────────────────────────────────
+p_full <- ggplot(all_specialties,
+       aes(x = rank, y = median_gap, colour = in_top10)) +
+  geom_point(
+    aes(size = in_top10),
+    alpha = 0.8
+  ) +
+  geom_hline(
+    yintercept = median(ma_providers$payment_gap),
+    linetype   = "dashed",
+    colour     = "grey40",
+    linewidth  = 0.6
+  ) +
+  # Top 10 ANOVA specialties — red labels
+  geom_text_repel(
+    data = all_specialties %>% filter(in_top10),
+    aes(label = Rndrng_Prvdr_Type),
+    size          = 2.5,
+    colour        = "#C8102E",
+    max.overlaps  = 20,
+    box.padding   = 0.4,
+    segment.color = "grey60"
+  ) +
+  # Top 5 facility outliers — blue labels
+  geom_text_repel(
+    data = all_specialties %>% filter(is_facility),
+    aes(label = Rndrng_Prvdr_Type),
+    size          = 2.5,
+    colour        = "#2166AC",
+    max.overlaps  = 20,
+    box.padding   = 0.4,
+    segment.color = "grey60"
+  ) +
+  # Bottom 10 — dark green labels
+  geom_text_repel(
+    data = all_specialties %>% filter(is_bottom_interesting),
+    aes(label = paste0(Rndrng_Prvdr_Type, "\n(n=", n, ")")),
+    size          = 2.3,
+    colour        = "#1B7837",
+    max.overlaps  = 20,
+    box.padding   = 0.4,
+    segment.color = "grey60",
+    nudge_x       = -5,
+    nudge_y       = -0.5
+  ) +
+  scale_colour_manual(
+    values = c("TRUE" = "#C8102E", "FALSE" = "grey60"),
+    labels = c("TRUE" = "Top 10 by count (ANOVA)", "FALSE" = "Excluded specialties"),
+    name   = NULL
+  ) +
+  scale_size_manual(
+    values = c("TRUE" = 2.5, "FALSE" = 1.2),
+    guide  = "none"
+  ) +
+  scale_y_log10(labels = scales::dollar) +
+  labs(
+    title    = "Medicare Payment Gap Across All 97 Massachusetts Provider Specialties",
+    subtitle = "Log scale — dashed line = Massachusetts provider median ($89,292)",
+    x        = "Specialty rank (1 = highest median gap)",
+    y        = "Median payment gap (log scale, $)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(size = 13),
+    plot.subtitle   = element_text(size = 10, colour = "grey40"),
+    legend.position = "bottom"
+  )
+
+# ── Plot 2: Zoomed — individual providers only (median gap < $1M) ─────────────
+p_zoom <- all_specialties %>%
+  filter(median_gap < 1000000) %>%
+  ggplot(aes(x = rank, y = median_gap, colour = in_top10)) +
+  geom_point(
+    aes(size = in_top10),
+    alpha = 0.8
+  ) +
+  geom_hline(
+    yintercept = median(ma_providers$payment_gap),
+    linetype   = "dashed",
+    colour     = "grey40",
+    linewidth  = 0.6
+  ) +
+  # Top 10 ANOVA specialties — red labels
+  geom_text_repel(
+    data = all_specialties %>%
+      filter(median_gap < 1000000, in_top10),
+    aes(label = Rndrng_Prvdr_Type),
+    size          = 2.5,
+    colour        = "#C8102E",
+    max.overlaps  = 20,
+    box.padding   = 0.4,
+    segment.color = "grey60"
+  ) +
+  # Excluded specialties above Diagnostic Radiology — blue labels
+  geom_text_repel(
+    data = all_specialties %>%
+      filter(median_gap < 1000000, !in_top10, rank <= 15),
+    aes(label = Rndrng_Prvdr_Type),
+    size          = 2.5,
+    colour        = "#2166AC",
+    max.overlaps  = 20,
+    box.padding   = 0.4,
+    segment.color = "grey60"
+  ) +
+  # Bottom 10 — dark green labels
+  geom_text_repel(
+    data = all_specialties %>%
+      filter(median_gap < 1000000, is_bottom_interesting),
+    aes(label = paste0(Rndrng_Prvdr_Type)),
+    size          = 2.3,
+    colour        = "#1B7837",
+    max.overlaps  = 20,
+    box.padding   = 0.4,
+    segment.color = "grey60",
+    nudge_x       = -3,
+    nudge_y       = 120000
+  ) +
+  scale_colour_manual(
+    values = c("TRUE" = "#C8102E", "FALSE" = "grey60"),
+    labels = c("TRUE" = "Top 10 by count (ANOVA)", "FALSE" = "Excluded specialties"),
+    name   = NULL
+  ) +
+  scale_size_manual(
+    values = c("TRUE" = 2.5, "FALSE" = 1.2),
+    guide  = "none"
+  ) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    title    = "Medicare Payment Gap — Individual Provider Specialties (Median Gap < $1M)",
+    subtitle = "Zoomed view excluding facility/equipment-based outliers — dashed line = provider median ($89,292)",
+    x        = "Specialty rank (1 = highest median gap)",
+    y        = "Median payment gap ($)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(size = 13),
+    plot.subtitle   = element_text(size = 10, colour = "grey40"),
+    legend.position = "bottom"
+  )
+
+print(p_full)
+print(p_zoom)
+
+ggsave(
+  here::here("docs", "figures", "all_specialties_ranked_log.png"),
+  plot  = p_full,
+  width = 10, height = 6, dpi = 300
+)
+
+ggsave(
+  here::here("docs", "figures", "all_specialties_ranked_zoom.png"),
+  plot  = p_zoom,
+  width = 10, height = 6, dpi = 300
+)
+```
+
+::: pattern-box
+**What the full-spectrum visualization reveals:**
+
+The log scale plot confirms that the gap distribution follows a
+smooth power-law decay across all 97 specialties. The top five
+positions are occupied entirely by facility and equipment-based
+entities --- Radiation Therapy Center (\$17.8M), Ambulatory Surgical
+Center (\$3.0M), Mammography Center (\$2.0M), Portable X-Ray
+Supplier (\$1.4M), and Independent Diagnostic Testing Facility
+(\$1.3M) --- whose gaps are one to two orders of magnitude larger
+than any individual physician specialty. These are not individual
+practitioners but institutional billers operating under a different
+billing logic, and their exclusion from the ANOVA is appropriate.
+
+The zoomed plot reveals a more substantive finding: at least nine
+excluded individual-type specialties have median gaps exceeding
+Diagnostic Radiology (\$358,812), the highest-gap ANOVA specialty.
+These include Ambulance Service Provider (\$867k), Hand Surgery
+(\$622k), Interventional Pain Management (\$606k), Ophthalmology
+(\$579k), Clinical Cardiac Electrophysiology (\$547k), Urology
+(\$525k), Orthopedic Surgery (\$496k), and Interventional Cardiology
+(\$496k). All are procedural or equipment-intensive specialties,
+consistent with the ANOVA finding that procedure-intensive practice
+patterns drive the largest gaps.
+
+Two implications follow. First, the ANOVA limitation stated in
+Section~5.2 --- that low-volume subspecialties may exhibit more
+extreme gaps than those analyzed --- is confirmed. Diagnostic
+Radiology anchors the top of the gap distribution among high-count
+specialties, but in the full specialty landscape it ranks
+approximately 20th. Second, the substantive conclusion of RQ2
+is strengthened rather than contradicted: the specialties with the
+largest gaps are uniformly procedural and equipment-intensive,
+regardless of whether they were formally tested. The ANOVA findings
+generalise directionally to the broader specialty landscape even
+though they cannot be extended statistically beyond the top 10.
+:::
+------------------------------------------------------------------------
+
+# Part 3: Logistic Regression (RQ3)
+
+::: fill-box
+**Research Question 3:** What provider and patient characteristics predict the
+log-odds of a Massachusetts provider having an above-median standardized Medicare
+payment gap?
+
+**Why logistic regression?** The outcome variable \texttt{high\_gap} is binary (1 =
+above-median payment gap, 0 = at or below median). Logistic regression models the
+log-odds of the outcome as a linear combination of predictors, allowing each
+coefficient to be interpreted as the change in log-odds for a one-unit increase in
+that predictor, holding all others constant. Exponentiating coefficients yields odds
+ratios (OR), which express the multiplicative change in the odds of being a high-gap
+provider.
+
+**Hypotheses:**
+
+$H_0$: None of the six predictors are associated with the log-odds of being a
+high-gap provider.
+
+$H_1$: At least one predictor is significantly associated with the log-odds of
+being a high-gap provider.
+:::
+
+```{r p3-logistic-fit}
+model_logistic <- glm(
+  high_gap ~ log(Tot_Benes) + log(srvcs_per_bene) + Bene_Avg_Risk_Scre +
+             pct_dual + drug_provider + log(Tot_HCPCS_Cds),
+  data   = ma_providers_rq3,
+  family = binomial(link = "logit")
+)
+
+cat("── Logistic Regression Summary ──\n")
+summary(model_logistic)
+```
+
+```{r p3-logistic-standardized}
+model_parameters(model_logistic, exponentiate = TRUE, standardize = "refit") |>
+  print()
+```
+
+------------------------------------------------------------------------
+
+## Odds Ratios and Confidence Intervals
+
+::: why-box
+**Why report odds ratios?**
+
+Logistic regression coefficients are on the log-odds scale, which is not directly
+interpretable. Exponentiating each coefficient yields an odds ratio --- the
+multiplicative factor by which the odds of being a high-gap provider change for a
+one-unit increase in the predictor, holding all other variables constant. An OR
+above 1 indicates higher odds of high-gap classification; an OR below 1 indicates
+lower odds.
+:::
+
+```{r p3-odds-ratios}
+cat("── Odds Ratios with 95% Confidence Intervals ──\n")
+tidy(model_logistic, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  print()
+```
+
+------------------------------------------------------------------------
+
+## Model Fit
+
+```{r p3-model-fit}
+cat("── Null and Residual Deviance ──\n")
+cat("Null deviance:     ", round(model_logistic$null.deviance, 2),
+    "on", model_logistic$df.null, "df\n")
+cat("Residual deviance: ", round(model_logistic$deviance, 2),
+    "on", model_logistic$df.residual, "df\n")
+
+cat("\n── McFadden Pseudo-R² ──\n")
+mcfadden <- 1 - (model_logistic$deviance / model_logistic$null.deviance)
+cat("McFadden R²:", round(mcfadden, 4), "\n")
+
+cat("\n── AIC ──\n")
+cat("AIC:", round(AIC(model_logistic), 2), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Threshold Selection and Confusion Matrix
+
+::: why-box
+**Why not use 0.5 as the classification threshold?**
+
+The default threshold of 0.5 assumes equal costs for false positives and false
+negatives, and implicitly assumes balanced classes. In this dataset, 62\% of
+providers are high-gap classifiers, so a naive model predicting high-gap for
+everyone would already achieve 62\% accuracy. More importantly, the research
+context favors sensitivity over specificity: correctly identifying high-gap
+providers is more valuable than avoiding false alarms, as the goal is to flag
+providers warranting further review. The threshold is selected by examining the
+ROC curve and choosing the value that maximises the sum of sensitivity and
+specificity (Youden's J statistic).
+:::
+
+```{r p3-threshold}
+
+pred_probs <- predict(model_logistic, type = "response")
+
+roc_obj <- roc(ma_providers_rq3$high_gap, pred_probs, quiet = TRUE)
+
+cat("── ROC AUC ──\n")
+cat("AUC:", round(auc(roc_obj), 4), "\n")
+
+# Youden's J: maximise sensitivity + specificity - 1
+youden_idx <- which.max(roc_obj$sensitivities + roc_obj$specificities - 1)
+optimal_threshold <- roc_obj$thresholds[youden_idx]
+cat("\n── Optimal threshold (Youden's J) ──\n")
+cat("Threshold:", round(optimal_threshold, 4), "\n")
+```
+
+```{r p3-confusion-matrix}
+pred_class <- ifelse(pred_probs >= optimal_threshold, 1, 0)
+
+cat("── Confusion Matrix ──\n")
+cm <- table(Predicted = pred_class, Actual = ma_providers_rq3$high_gap)
+print(cm)
+
+TP <- cm[2, 2]; TN <- cm[1, 1]
+FP <- cm[2, 1]; FN <- cm[1, 2]
+
+accuracy    <- round((TP + TN) / sum(cm), 4)
+sensitivity <- round(TP / (TP + FN), 4)
+specificity <- round(TN / (TN + FP), 4)
+precision   <- round(TP / (TP + FP), 4)
+
+cat("\n── Classification Metrics ──\n")
+cat("Accuracy:   ", accuracy,    "\n")
+cat("Sensitivity:", sensitivity, "\n")
+cat("Specificity:", specificity, "\n")
+cat("Precision:  ", precision,   "\n")
+```
+
+------------------------------------------------------------------------
+
+## ROC Curve
+
+```{r p3-roc-plot, fig.cap="ROC curve for the logistic regression model predicting high-gap provider classification. The dashed diagonal represents a random classifier (AUC = 0.5). The filled point marks the optimal threshold selected by Youden's J statistic."}
+roc_df <- data.frame(
+  fpr  = 1 - roc_obj$specificities,
+  tpr  = roc_obj$sensitivities
+)
+
+optimal_point <- data.frame(
+  fpr = 1 - roc_obj$specificities[youden_idx],
+  tpr = roc_obj$sensitivities[youden_idx]
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(colour = "#2166AC", linewidth = 0.9) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_point(
+    data   = optimal_point,
+    aes(x = fpr, y = tpr),
+    colour = "#C8102E", size = 3
+  ) +
+  annotate(
+    "text",
+    x     = optimal_point$fpr + 0.05,
+    y     = optimal_point$tpr - 0.03,
+    label = paste0("Threshold = ", round(optimal_threshold, 3)),
+    size  = 3.5, colour = "#C8102E"
+  ) +
+  labs(
+    title    = "ROC Curve — High-Gap Provider Classification",
+    subtitle = paste0("AUC = ", round(auc(roc_obj), 4),
+                      "  |  n = ", scales::comma(nrow(ma_providers_rq3))),
+    x        = "False Positive Rate (1 - Specificity)",
+    y        = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40")
+  )
+
+ggsave(
+  here::here("docs", "figures", "roc_curve.png"),
+  width = 6, height = 5, dpi = 300
+)
+```
+
+::: why-box
+**Why run a sensitivity analysis on the classification threshold?**
+The \texttt{high\_gap} outcome is defined at the Massachusetts
+provider median (\$89,292) --- a convenient and interpretable cutoff,
+but an arbitrary one. There is no clinical or policy reason why the
+50th percentile specifically defines "high" billing behavior. A
+provider at the 51st percentile and one at the 95th percentile are
+treated identically as high-gap, while a provider at the 49th
+percentile is treated as low-gap despite being nearly identical to
+the 51st.
+
+If the logistic regression findings are genuinely capturing
+structural differences in billing behavior, the odds ratios should
+remain stable when the outcome definition shifts. If a finding
+disappears or reverses at a different threshold --- for example, if
+the dual-eligibility association vanishes when only the top quarter
+of providers are classified as high-gap --- that would suggest the
+result is sensitive to the specific cutoff rather than reflecting a
+robust underlying pattern.
+
+The model is therefore refit at four thresholds: the 40th, 50th,
+60th, and 75th percentiles of the payment gap distribution in the
+RQ3 analysis dataset. All six predictors and the full model
+specification are held constant; only the definition of the outcome
+variable changes. This is not a different analysis --- it is the
+same analysis asking whether the same predictors remain reliable
+signals of high-gap classification when "high-gap" is defined more
+or less strictly.
+:::
+
+```{r p3-threshold-sensitivity}
+cat("── Sensitivity Analysis: Odds Ratios Across Classification Thresholds ──\n")
+
+# Define thresholds at 40th, 50th, 60th, and 75th percentiles
+thresholds <- c(0.40, 0.50, 0.60, 0.75)
+
+sensitivity_results <- bind_rows(
+  lapply(thresholds, function(q) {
+    
+    # Redefine high_gap at each percentile threshold
+    cutoff <- quantile(ma_providers_rq3$payment_gap, q)
+    
+    df <- ma_providers_rq3 %>%
+      mutate(high_gap_q = as.integer(payment_gap > cutoff))
+    
+    # Refit logistic regression with new outcome
+    fit <- glm(
+      high_gap_q ~ log(Tot_Benes) + log(srvcs_per_bene) + Bene_Avg_Risk_Scre +
+                   pct_dual + drug_provider + log(Tot_HCPCS_Cds),
+      data   = df,
+      family = binomial(link = "logit")
+    )
+    
+    # Extract odds ratios
+    tidy(fit, conf.int = TRUE, exponentiate = TRUE) %>%
+      filter(term != "(Intercept)") %>%
+      mutate(
+        threshold     = q,
+        cutoff_dollar = scales::dollar(round(cutoff, 0))
+      )
+  })
+)
+
+# Print clean summary table
+sensitivity_results %>%
+  select(threshold, cutoff_dollar, term, estimate, conf.low, conf.high, p.value) %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~round(., 3))) %>%
+  mutate(p.value = round(p.value, 4)) %>%
+  arrange(term, threshold) %>%
+  print(n = Inf)
+```
+
+::: fill-box
+**Reading the threshold sensitivity plot:**
+Each panel shows one predictor. The x-axis shows the four
+classification thresholds: P40 (40th percentile, \$95,769), P50
+(50th percentile, \$132,121 --- the main analysis), P60 (60th
+percentile, \$178,079), and P75 (75th percentile, \$292,776). The
+y-axis shows the odds ratio at each threshold. The shaded band is
+the 95\% confidence interval. The dashed horizontal line marks
+OR = 1, which would indicate no association.
+
+**What to look for:**
+
+- **Flat lines staying well away from OR = 1** --- the predictor is
+  robust. Its association with high-gap classification does not
+  depend on how strictly high-gap is defined.
+- **Lines drifting toward OR = 1** --- the predictor attenuates at
+  stricter thresholds. It distinguishes above-median providers from
+  below-median ones but loses power when only the most extreme
+  billers are in the high-gap group.
+- **Lines crossing OR = 1 or changing direction** --- the finding
+  is threshold-sensitive and should be interpreted cautiously.
+- **For predictors with OR below 1** (pct\_dual, drug\_provider):
+  moving further below 1 means the negative association is becoming
+  more pronounced; moving toward 1 means it is attenuating.
+
+Note that the y-axis is free-scaled across panels --- do not compare
+the absolute vertical range across panels, only the shape of each
+line relative to its own OR = 1 reference.
+:::
+
+```{r p3-threshold-sensitivity-plot}
+
+sensitivity_results <- sensitivity_results %>%
+  mutate(
+    term_label = case_when(
+      term == "log(Tot_Benes)"      ~ "log(Tot_Benes)",
+      term == "log(srvcs_per_bene)" ~ "log(srvcs_per_bene)",
+      term == "Bene_Avg_Risk_Scre"  ~ "Bene_Avg_Risk_Scre",
+      term == "pct_dual"            ~ "pct_dual",
+      term == "drug_providerTRUE"   ~ "drug_provider",
+      term == "drug_provider"       ~ "drug_provider",
+      term == "log(Tot_HCPCS_Cds)"  ~ "log(Tot_HCPCS_Cds)",
+      TRUE ~ term
+    ),
+    threshold_label = paste0("P", threshold * 100)
+  )
+
+ggplot(sensitivity_results,
+       aes(x = threshold_label, y = estimate, group = term_label)) +
+  # CI band
+  geom_ribbon(
+    aes(ymin = conf.low, ymax = conf.high),
+    fill  = "#2166AC",
+    alpha = 0.15
+  ) +
+  # Line connecting estimates
+  geom_line(
+    colour    = "#2166AC",
+    linewidth = 0.8
+  ) +
+  # Points
+  geom_point(
+    colour = "#2166AC",
+    size   = 3
+  ) +
+  # Reference line at OR = 1
+  geom_hline(
+    yintercept = 1,
+    linetype   = "dashed",
+    colour     = "grey40",
+    linewidth  = 0.6
+  ) +
+  facet_wrap(~ term_label, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Logistic Regression Odds Ratios Across Classification Thresholds",
+    subtitle = "Shaded band = 95% CI. P50 = median threshold (main analysis).\nDashed line = OR of 1 (no effect).",
+    x        = "Classification threshold",
+    y        = "Odds ratio"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 9, colour = "grey40"),
+    strip.text    = element_text(size = 10, face = "bold")
+  )
+
+ggsave(
+  here::here("docs", "figures", "threshold_sensitivity.png"),
+  width = 9, height = 6, dpi = 300
+)
+```
+
+::: pattern-box
+**What the sensitivity analysis reveals:**
+All six predictors maintain the same sign and remain statistically
+significant at every threshold. No finding reverses or approaches
+the null. The logistic regression results are not an artifact of
+the median split.
+
+**\texttt{log(Tot\_Benes)}** is the most stable predictor: 6.89,
+6.95, 6.99 at P40 through P60, attenuating modestly to 6.04 at P75.
+Provider volume dominates high-gap classification at every threshold.
+
+**\texttt{pct\_dual}** shows the most substantively interesting
+pattern. The negative association becomes more pronounced as the
+threshold rises --- OR = 0.202 at P40, dropping to 0.090 at P60,
+then recovering slightly to 0.121 at P75. Providers serving panels
+with higher proportions of dual-eligible patients are increasingly
+unlikely to be classified as high-gap as the definition of high-gap
+tightens. The OR remains far below 1 at every threshold and the
+confidence bands never approach the null.
+
+**\texttt{log(srvcs\_per\_bene)}** shows a mild upward trend from
+2.66 at P40 to 2.83 at P75. Billing intensity is slightly more
+discriminating at stricter thresholds, consistent with the Model 1
+quantile regression finding that billing intensity matters more for
+providers at the upper tail of the gap distribution.
+
+**\texttt{Bene\_Avg\_Risk\_Scre}**, **\texttt{log(Tot\_HCPCS\_Cds)}**,
+and **\texttt{drug\_provider}** all attenuate at P75 but remain
+strongly significant. The consistent attenuation across these three
+predictors at the strictest threshold suggests that the very top
+quarter of the gap distribution is somewhat less differentiated by
+patient complexity, practice breadth, and drug billing status ---
+volume and billing intensity become the relatively more dominant
+signals at the extreme top.
+:::
+
+
+::: why-box
+**Why add specialty as a covariate to the logistic regression?**
+The base logistic regression includes six predictors spanning
+billing behavior, patient complexity, practice breadth, and
+dual-eligibility burden, but not specialty. This is a
+deliberate choice: specialty is not one of the six readily
+observable characteristics the model is designed to use as a
+screening tool, and adding specialty dummies would change the
+question from "what provider characteristics predict high-gap
+classification" to "what characteristics predict high-gap
+classification within a given specialty."
+
+However, omitting specialty raises a legitimate concern. The
+observed associations, particularly for \texttt{pct\_dual},
+could reflect specialty composition rather than independent
+billing behavior. Providers serving high dual-eligibility panels
+may simply be concentrated in inherently low-gap specialties
+such as Psychiatry or Licensed Clinical Social Work, in which
+case the dual-eligibility finding would be a specialty effect
+in disguise rather than a genuine association with billing
+behavior.
+
+The specialty-controlled refit addresses this directly by adding
+specialty group membership as a covariate (top 10 specialties
+by provider count plus an \textit{Other} category) and comparing
+the core odds ratios to those from the base model. If the
+findings are robust, the odds ratios should be stable or
+strengthen after specialty adjustment. If they attenuate toward
+1, the base model findings were partially explained by specialty
+composition.
+:::
+
+```{r p3-logistic-specialty}
+# Add specialty as a covariate to the logistic regression
+# Use top 10 specialties as explicit dummies, collapse rest to "Other"
+ma_providers_rq3_specialty <- ma_providers_rq3 %>%
+  mutate(
+    specialty_group = ifelse(
+      Rndrng_Prvdr_Type %in% top10_specialties,
+      Rndrng_Prvdr_Type,
+      "Other"
+    ),
+    specialty_group = factor(specialty_group)
+  )
+
+model_logistic_specialty <- glm(
+  high_gap ~ log(Tot_Benes) + log(srvcs_per_bene) + Bene_Avg_Risk_Scre +
+             pct_dual + drug_provider + log(Tot_HCPCS_Cds) +
+             specialty_group,
+  data   = ma_providers_rq3_specialty,
+  family = binomial(link = "logit")
+)
+
+cat("── Logistic Regression with Specialty Controls ──\n")
+summary(model_logistic_specialty)
+
+cat("\n── McFadden Pseudo-R² with specialty ──\n")
+mcfadden_sp <- 1 - (model_logistic_specialty$deviance /
+                    model_logistic_specialty$null.deviance)
+cat("McFadden R²:", round(mcfadden_sp, 4), "\n")
+
+cat("\n── AUC with specialty ──\n")
+pred_probs_sp <- predict(model_logistic_specialty, type = "response")
+roc_sp <- roc(ma_providers_rq3_specialty$high_gap,
+              pred_probs_sp, quiet = TRUE)
+cat("AUC:", round(auc(roc_sp), 4), "\n")
+```
+
+::: fill-box
+**Reading the specialty robustness comparison:**
+The comparison plot shows odds ratios for the six core predictors
+side by side: the base model (blue) and the specialty-controlled
+model (red). The dashed horizontal line marks OR = 1 (no
+effect). Each panel shows one predictor on a free y-axis scale.
+
+**What to look for:**
+
+- **Points close together** --- the predictor is robust to
+  specialty adjustment. Its association with high-gap
+  classification is not explained by specialty composition.
+- **Red point closer to 1 than blue** --- the predictor
+  attenuates after specialty control. Some of its apparent
+  effect was a specialty proxy.
+- **Red point further from 1 than blue** --- the predictor
+  strengthens after specialty control. Specialty was acting
+  as a suppressor, and the true within-specialty association
+  is stronger than the base model suggested.
+
+For predictors with OR below 1 (\texttt{pct\_dual},
+\texttt{drug\_provider}): moving further below 1 means
+the negative association strengthens; moving toward 1
+means it attenuates.
+
+The model fit comparison (McFadden $R^2$ and AUC) indicates
+how much additional explanatory power specialty adds. A large
+improvement would suggest the base model was substantially
+misspecified; a modest improvement would confirm specialty
+adds some but not decisive explanatory power.
+:::
+
+```{r p3-logistic-specialty-comparison}
+# Compare key ORs between base model and specialty-controlled model
+cat("── Key OR comparison: base vs specialty-controlled model ──\n")
+
+# Core predictors to compare — exclude specialty dummies
+core_terms <- c(
+  "log(Tot_Benes)",
+  "log(srvcs_per_bene)",
+  "Bene_Avg_Risk_Scre",
+  "pct_dual",
+  "drug_provider",
+  "log(Tot_HCPCS_Cds)"
+)
+
+bind_rows(
+  tidy(model_logistic, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(model = "Base model"),
+  tidy(model_logistic_specialty, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(model = "Specialty-controlled")
+) %>%
+  filter(term %in% core_terms) %>%
+  select(model, term, estimate, conf.low, conf.high, p.value) %>%
+  mutate(
+    across(c(estimate, conf.low, conf.high), ~round(., 3)),
+    p.value = round(p.value, 4)
+  ) %>%
+  arrange(term, model) %>%
+  print(n = Inf)
+
+cat("\n── Model fit comparison ──\n")
+cat("Base model      — McFadden R²:", round(mcfadden, 4),
+    "| AUC:", round(auc(roc_obj), 4), "\n")
+cat("Specialty model — McFadden R²:", round(mcfadden_sp, 4),
+    "| AUC:", round(auc(roc_sp), 4), "\n")
+```
+
+
+```{r p3-logistic-specialty-plot}
+
+or_comparison <- bind_rows(
+  tidy(model_logistic, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(model = "Base model"),
+  tidy(model_logistic_specialty, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(model = "Specialty-controlled")
+) %>%
+  filter(term %in% core_terms) %>%
+  mutate(
+    term = case_when(
+      term == "log(Tot_Benes)"      ~ "log(Tot_Benes)",
+      term == "log(srvcs_per_bene)" ~ "log(srvcs_per_bene)",
+      term == "Bene_Avg_Risk_Scre"  ~ "Bene_Avg_Risk_Scre",
+      term == "pct_dual"            ~ "pct_dual",
+      term == "drug_providerTRUE"   ~ "drug_provider",
+      term == "drug_provider"       ~ "drug_provider",
+      term == "log(Tot_HCPCS_Cds)"  ~ "log(Tot_HCPCS_Cds)",
+      TRUE ~ term
+    )
+  )
+
+ggplot(or_comparison,
+       aes(x = model, y = estimate,
+           ymin = conf.low, ymax = conf.high,
+           colour = model)) +
+  geom_pointrange(size = 0.6) +
+  geom_hline(
+    yintercept = 1,
+    linetype   = "dashed",
+    colour     = "grey40",
+    linewidth  = 0.6
+  ) +
+  facet_wrap(~ term, scales = "free_y", ncol = 2) +
+  scale_colour_manual(
+    values = c(
+      "Base model"           = "#2166AC",
+      "Specialty-controlled" = "#C8102E"
+    ),
+    guide = "none"
+  ) +
+  labs(
+    title    = "Logistic Regression OR Comparison: Base vs Specialty-Controlled",
+    subtitle = "Blue = base model; Red = specialty dummies added. Dashed line = OR of 1.",
+    x        = NULL,
+    y        = "Odds ratio"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40"),
+    strip.text    = element_text(size = 10, face = "bold")
+  )
+
+ggsave(
+  here::here("docs", "figures", "specialty_controlled_or.png"),
+  width = 9, height = 6, dpi = 300
+)
+```
+
+::: pattern-box
+**What the specialty robustness check reveals:**
+All six core findings are stable or strengthen after controlling
+for specialty group membership. No predictor attenuates toward
+the null.
+
+**\texttt{pct\_dual}}** moves from OR = 0.212 to OR = 0.168
+after specialty adjustment --- strengthening rather than
+attenuating. This directly rules out the most obvious
+alternative explanation for the dual-eligibility finding:
+high dual-eligibility providers are not simply concentrated
+in inherently low-gap specialties. The association between
+dual-eligibility burden and lower gap odds persists and
+intensifies within specialty.
+
+**\texttt{log(Tot\_Benes)}}** strengthens from 6.72 to 7.73,
+indicating that within a given specialty, volume is an even
+stronger differentiator of billing behavior than it appears
+across specialties. Specialty and volume are partially
+correlated --- high-volume providers tend to cluster in
+certain specialties --- and controlling for specialty isolates
+the within-specialty volume effect.
+
+**\texttt{log(Tot\_HCPCS\_Cds)}}** attenuates modestly from
+3.77 to 3.62, the only predictor that moves toward the null.
+This is expected: practice breadth and specialty are related,
+since different specialties have characteristically different
+procedure repertoires. The attenuation is modest, confirming
+that breadth captures something beyond specialty membership.
+
+**\texttt{log(srvcs\_per\_bene)}}**, **\texttt{Bene\_Avg\_Risk\_Scre}}**,
+and **\texttt{drug\_provider}}** are all stable across
+specifications.
+
+McFadden $R^2$ improves from 0.439 to 0.462 and AUC from
+0.905 to 0.913 after adding specialty --- a modest improvement
+confirming that specialty adds real but not decisive
+explanatory power. The base model was not substantially
+misspecified; specialty is a useful additional signal but
+not a confound of the core findings.
+:::
+------------------------------------------------------------------------
+
+# Part 4: Bootstrap & Permutation Test (RQ4)
+
+::: fill-box
+**Research Question 4:** Does the median standardized Medicare payment gap differ
+significantly between Massachusetts providers whose patient panels have low versus
+high proportions of dual-eligible beneficiaries?
+:::
+
+::: why-box
+**Why Bootstrap & Permutation Tests?**
+
+The payment gap distribution is heavily right-skewed with extreme outliers, making
+parametric confidence intervals for the median unreliable. The median is not amenable
+to a simple formula-based standard error under these distributional conditions, and
+even after log transformation the tails remain heavy. Bootstrap resampling constructs
+a confidence interval for each group's median empirically, making no distributional
+assumptions. The permutation test then assesses whether the observed difference in
+median payment gaps between the two groups could plausibly arise by chance under the
+null hypothesis of no difference, without assuming normality in either group.
+
+The dual-eligibility comparison is motivated directly by RQ3, which identified
+`pct_dual` as a strong negative predictor of high-gap classification (OR = 0.186).
+RQ4 examines whether this association persists unconditionally and quantifies its
+magnitude in raw dollar terms.
+:::
+
+```{r p4-setup}
+set.seed(6105)
+
+ma_providers_rq4 <- ma_providers_rq3 %>%
+  mutate(
+    dual_group = ifelse(
+      pct_dual > median(pct_dual),
+      "High dual-eligibility",
+      "Low dual-eligibility"
+    )
+  )
+
+cat("── Group sizes ──\n")
+table(ma_providers_rq4$dual_group)
+
+low_gap  <- ma_providers_rq4$payment_gap[
+  ma_providers_rq4$dual_group == "Low dual-eligibility"
+]
+high_gap <- ma_providers_rq4$payment_gap[
+  ma_providers_rq4$dual_group == "High dual-eligibility"
+]
+
+obs_diff <- median(low_gap) - median(high_gap)
+
+cat("\n── Observed medians ──\n")
+cat("Low dual-eligibility:  $", scales::comma(round(median(low_gap))), "\n")
+cat("High dual-eligibility: $", scales::comma(round(median(high_gap))), "\n")
+cat("Observed difference:   $", scales::comma(round(obs_diff)), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Step 1: Bootstrap Confidence Intervals for Each Group Median
+
+::: why-box
+**Why bootstrap the median separately for each group?**
+
+The bootstrap constructs a confidence interval by repeatedly resampling each group
+with replacement and computing the median on each resample. With 10,000 replicates,
+the distribution of bootstrapped medians approximates the sampling distribution of
+the observed median, from which percentile-based 95\% confidence intervals are
+derived. No assumption is made about the shape of the payment gap distribution within
+each group. Constructing separate CIs for each group's median makes the uncertainty
+in each estimate visible before the formal hypothesis test.
+:::
+
+```{r p4-bootstrap}
+B <- 10000
+
+# Bootstrap CI for low dual-eligibility median
+boot_low <- replicate(B, median(sample(low_gap, length(low_gap), replace = TRUE)))
+ci_low   <- quantile(boot_low, c(0.025, 0.975))
+
+# Bootstrap CI for high dual-eligibility median
+boot_high <- replicate(B, median(sample(high_gap, length(high_gap), replace = TRUE)))
+ci_high   <- quantile(boot_high, c(0.025, 0.975))
+
+cat("── Bootstrap Results (B = 10,000) ──\n\n")
+
+cat("Low dual-eligibility:\n")
+cat("  Observed median: $", scales::comma(round(median(low_gap))), "\n")
+cat("  95% CI:         [$", scales::comma(round(ci_low[1])),
+    ", $", scales::comma(round(ci_low[2])), "]\n\n")
+
+cat("High dual-eligibility:\n")
+cat("  Observed median: $", scales::comma(round(median(high_gap))), "\n")
+cat("  95% CI:         [$", scales::comma(round(ci_high[1])),
+    ", $", scales::comma(round(ci_high[2])), "]\n")
+```
+
+```{r p4-bootstrap-plot, fig.cap="Bootstrap distributions of the median payment gap for low and high dual-eligibility providers (10,000 replicates each). Vertical solid lines mark the observed medians; dashed lines mark the 95% confidence interval bounds. Non-overlapping intervals indicate a statistically reliable difference."}
+boot_df <- bind_rows(
+  data.frame(group = "Low dual-eligibility",  median = boot_low),
+  data.frame(group = "High dual-eligibility", median = boot_high)
+)
+
+ci_df <- data.frame(
+  group  = c("Low dual-eligibility", "Low dual-eligibility",
+             "High dual-eligibility", "High dual-eligibility"),
+  x      = c(ci_low[1], ci_low[2], ci_high[1], ci_high[2]),
+  ltype  = rep(c("lower", "upper"), 2)
+)
+
+obs_df <- data.frame(
+  group = c("Low dual-eligibility", "High dual-eligibility"),
+  x     = c(median(low_gap), median(high_gap))
+)
+
+ggplot(boot_df, aes(x = median, fill = group)) +
+  geom_histogram(bins = 60, alpha = 0.8) +
+  geom_vline(data = obs_df, aes(xintercept = x),
+             colour = "#C8102E", linewidth = 1) +
+  geom_vline(data = ci_df, aes(xintercept = x),
+             colour = "#C8102E", linewidth = 0.7, linetype = "dashed") +
+  scale_fill_manual(values = c(
+    "Low dual-eligibility"  = "#C8102E",
+    "High dual-eligibility" = "#2166AC"
+  ), name = NULL) +
+  scale_x_continuous(labels = scales::dollar) +
+  facet_wrap(~group, scales = "free_x") +
+  labs(
+    title    = "Bootstrap Distribution of Median Payment Gap by Dual-Eligibility Group",
+    subtitle = "B = 10,000 replicates | Solid line = observed median | Dashed = 95% CI",
+    x        = "Bootstrapped Median ($)",
+    y        = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(size = 13),
+    plot.subtitle   = element_text(size = 10, colour = "grey40")
+  )
+
+ggsave(
+  here::here("docs", "figures", "bootstrap_distribution.png"),
+  width = 10, height = 5, dpi = 300
+)
+```
+
+------------------------------------------------------------------------
+
+## Step 2: Permutation Test
+
+::: why-box
+**Why a permutation test?**
+
+The permutation test asks: if group membership were assigned randomly, how often
+would we observe a difference in median payment gaps as large as the one actually
+observed? Under the null hypothesis of no difference, the group labels are
+exchangeable. By randomly permuting the labels 10,000 times and computing the
+difference in medians each time, we build an empirical null distribution against
+which the observed difference is compared. The p-value is the proportion of permuted
+differences that equal or exceed the observed difference in absolute magnitude.
+
+**Hypotheses:**
+
+$H_0$: The median payment gap is equal for low and high dual-eligibility providers.
+
+$H_1$: The median payment gap differs between low and high dual-eligibility providers.
+:::
+
+```{r p4-permutation}
+N_perm <- 10000
+
+perm_diffs <- replicate(N_perm, {
+  shuffled <- sample(ma_providers_rq4$dual_group)
+  median(ma_providers_rq4$payment_gap[shuffled == "Low dual-eligibility"]) -
+  median(ma_providers_rq4$payment_gap[shuffled == "High dual-eligibility"])
+})
+
+perm_p <- mean(abs(perm_diffs) >= abs(obs_diff))
+
+cat("── Permutation Test Results (N = 10,000) ──\n")
+cat("Observed difference: $", scales::comma(round(obs_diff)), "\n")
+cat("Permutation p-value:", ifelse(perm_p == 0, "< 0.0001", round(perm_p, 4)), "\n")
+```
+
+```{r p4-permutation-plot, fig.cap="Empirical null distribution of 10,000 permuted differences in median payment gap. The red vertical lines mark the observed difference and its negative mirror. The proportion of permuted differences falling outside these lines gives the two-sided permutation p-value."}
+ggplot(data.frame(diff = perm_diffs), aes(x = diff)) +
+  geom_histogram(bins = 60, fill = "#2166AC", alpha = 0.8) +
+  geom_vline(xintercept =  obs_diff, colour = "#C8102E", linewidth = 1) +
+  geom_vline(xintercept = -obs_diff, colour = "#C8102E", linewidth = 1) +
+  scale_x_continuous(labels = scales::dollar) +
+  labs(
+    title    = "Permutation Null Distribution — Difference in Median Payment Gap",
+    subtitle = paste0("N = 10,000 permutations | Observed difference = $",
+                      scales::comma(round(obs_diff))),
+    x        = "Permuted Difference in Medians ($)",
+    y        = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40")
+  )
+
+ggsave(
+  here::here("docs", "figures", "permutation_distribution.png"),
+  width = 7, height = 5, dpi = 300
+)
+```
+
+------------------------------------------------------------------------
+
+## Step 3: Parametric Comparison
+
+::: why-box
+**Why compare to a parametric alternative?**
+
+The Wilcoxon rank-sum test is a nonparametric alternative to the two-sample t-test
+that does not assume normality but relies on asymptotic approximations for large
+samples. Comparing its conclusion to the permutation test result assesses whether
+the two approaches agree. The Hodges-Lehmann estimate reported by the Wilcoxon test
+with `conf.int = TRUE` provides a pseudomedian difference that can be compared
+directly to the bootstrap CIs.
+:::
+
+```{r p4-wilcoxon}
+cat("── Wilcoxon Rank-Sum Test ──\n")
+wilcox.test(
+  payment_gap ~ dual_group,
+  data       = ma_providers_rq4,
+  conf.int   = TRUE,
+  conf.level = 0.95
+)
+```

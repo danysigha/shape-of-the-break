@@ -1,0 +1,1527 @@
+---
+title: "CMS Medicare Physician & Other Practitioners by Provider dataset for 2023 preprocessing"
+subtitle: "INFO 6105 Final Project"
+author: "Dany De Leriol Nohonet Sigha"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup-preprocessing, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+```{=html}
+<style>
+body { font-family: 'Palatino', 'Georgia', serif; }
+h1, h2 { color: #C8102E; }
+h3 { color: #444; }
+.try-it {
+  border: 2px solid #C8102E; padding: 12px; margin: 10px 0;
+  background-color: #fdf5f5; border-radius: 5px;
+}
+.why-box {
+  border-left: 5px solid #2166AC; padding: 10px 15px;
+  margin: 10px 0; background-color: #f0f6fc;
+}
+.pattern-box {
+  border: 2px solid #28A745; padding: 12px; margin: 10px 0;
+  background-color: #f0fff4; border-radius: 5px;
+}
+</style>
+```
+
+------------------------------------------------------------------------
+
+# Welcome
+
+This is the data preprocessing step for the "Medicare Payment Gap Analysis in Massachussets" final project. 
+
+This file will:
+
+- Filter the dataset to only include providers in Massachussets.
+
+- Aggregated to the provider level by grouping on NPI and summing Tot_Sbmtd_Chrg, Tot_Mdcr_Stdzd_Amt, and Tot_Srvcs across all procedure--setting rows, while retaining provider-level attributes---including specialty, geographic identifiers, and beneficiary characteristics---from the first record per NPI, as these are invariant within provider.
+
+- Compute the payment gap using payment_gap = Tot_Sbmtd_Chrg - Tot_Mdcr_Stdzd_Amt
+
+- Generate a summary of the payment gap data
+
+- Generate a summary of Total Beneficiaries
+
+- Generate a summary of Total Services
+
+- Compute the number of unique specialties and find the top 10 specialties by provider count
+
+- Look for missing values
+
+- Verify Chronic condition prevalence variables Bene_CC_* fall within the [0-1] range
+
+- Generate payment gap distribution visualization
+
+- Investigate the need for quantile regression
+
+- Generate a Payment Gap by Provider Specialty visualization
+
+- Create a high_gap binary variable for each record
+
+- Investigate the geographic distribution of providers by RUCA classification to assess
+the viability of a rural/urban comparison
+
+- Derive and prepare RQ3/RQ4 predictors: compute pct_dual (proportion of dual-eligible
+beneficiaries) and pct_drug (proportion of drug-related submitted charges)
+
+- Lasso coefficients compution to identify which chronic condition prevalence variables to include or drop from the multiple linear regression analysis
+
+- Correlation matrix of chronic condition prevalence variables to each other and the log payment gap
+
+**Dataset:** `MUP_PHY_R25_P05_V20_D23_Prov.csv` — 1,259,343 rows, each a provider--procedure--setting combination in 2023. Each row represents the aggregated activity for a specific provider performing a specific procedure (identified by HCPCS code) in a specific care setting (facility or non-facility) over the full 2023 reporting year, capturing totals such as number of times the service was rendered, number of unique beneficiaries who received it, total submitted charges, and total Medicare payments for that provider-procedure-setting combination.
+
+Missing values are absent across all key variables, including payment_gap, Tot_Sbmtd_Chrg, Tot_Mdcr_Stdzd_Amt, Tot_Benes, Tot_Srvcs, Rndrng_Prvdr_Type, Bene_Avg_Age, Bene_Avg_Risk_Scre, and all chronic condition percentage variables.
+
+------------------------------------------------------------------------
+
+# Setup
+
+```{r preprocessing-setup}
+# Install if needed (uncomment once, then re-comment)
+
+library(tidyverse)
+library(haven)
+library(broom)
+library(car)
+library(pROC)
+library(boot)
+library(multcomp)
+library(glmnet)
+library(corrplot)
+library(car)
+library(quantreg)
+
+# Explicitly prefer dplyr functions over masked alternatives
+select    <- dplyr::select
+filter    <- dplyr::filter
+summarise <- dplyr::summarise
+
+theme_set(theme_minimal(base_size = 13))
+```
+
+------------------------------------------------------------------------
+
+# Part 1: payment gap exploration
+
+::: fill-box
+**Payment gap in Massachussets:**
+
+payment_gap = Tot_Sbmtd_Chrg - Tot_Mdcr_Stdzd_Amt
+
+Tot_Sbmtd_Chrg corresponds to the total charges that the provider submitted for all services.
+
+Tot_Mdcr_Stdzd_Amt is the total amount that Medicare paid after deductible and coinsurance amounts have been deducted for the line item service and after standardization of the Medicare payment has been applied.
+
+**Why?** The Tot_Mdcr_Stdzd_Amt removes geographic adjustments for local wages and input prices, such as the Medicare Geographic Practice Cost Index, making payment levels comparable across Massachusetts geographies.
+
+The payment gap as constructed captures two distinct phenomena that the first research question explicitly accounts for. First, it may reflect provider billing intensity, providers who systematically submit charges far above what Medicare considers reasonable for the services rendered. Second, it may reflect patient complexity, sicker patients generate more expensive services, and since Medicare’s payment covers only the non-deductible, non-coinsurance portion, providers serving higher-complexity panels will mechanically show larger gaps even if their billing behavior is identical to providers serving healthier patients. These two phenomena are disentangled in the regression analysis (RQ1) by controlling for average beneficiary risk score
+(Bene_Avg_Risk_Scre) and chronic condition prevalence (Bene_CC_*).
+
+**The approach:**
+
+1. Filter data on records where Rndrng_Prvdr_State_Abrvtn is "MA"
+2. Create a payment_gap variable where payment_gap = Tot_Sbmtd_Chrg - Tot_Mdcr_Stdzd_Amt
+3. Compute services per beneficiary srvcs_per_bene = Tot_Srvcs / Tot_Benes. This ratio can give insight into over billing patterns
+4. Generate a summary of the payment gap data
+:::
+
+```{r p1-payment-gap-exploration}
+# Load the Medicare Physician & Other Practitioners by Provider dataset (CMS, 2023)
+cms_data <- read_csv("../data/raw/MUP_PHY_R25_P05_V20_D23_Prov.csv")
+#glimpse(cms_data)
+
+# ── Step 1: Massachusetts subset ──────────────────────────────────────────────────────
+ma_providers <- cms_data %>%
+  filter(Rndrng_Prvdr_State_Abrvtn == "MA")
+
+# ── Step 2: Create payment gap variable ──────────────────────────────────────────────────────
+ma_providers <- ma_providers %>%
+  mutate(payment_gap = Tot_Sbmtd_Chrg - Tot_Mdcr_Stdzd_Amt)
+
+# ── Step 3: Create services per beneficiary ratio variable ──────────────────────────────────
+ma_providers <- ma_providers %>%
+  mutate(srvcs_per_bene = Tot_Srvcs / Tot_Benes)
+
+# ── Structure ─────────────────────────────────────────────────────────────────
+cat("Number of MA providers:", nrow(ma_providers), "\n")
+cat("Number of variables:", ncol(ma_providers), "\n")
+glimpse(ma_providers)
+
+# ── Step 4: Payment gap data summary ──────────────────────────────────
+cat("\n── Payment Gap Summary (MA) ──\n")
+summary(ma_providers$payment_gap)
+
+# Total beneficiaries and services
+cat("\n── Total Beneficiaries Summary (MA) ──\n")
+summary(ma_providers$Tot_Benes)
+
+cat("\n── Total Services Summary (MA) ──\n")
+summary(ma_providers$Tot_Srvcs)
+```
+```{r p1-filter-nonpositive-gaps}
+# The payment gap summary above reveals a negative minimum, indicating a small
+# number of providers where Tot_Mdcr_Stdzd_Amt exceeds Tot_Sbmtd_Chrg.
+# These 5 records are anomalous — Medicare's geographic standardization
+# adjustment can marginally inflate the standardized payment above the
+# submitted charge in edge cases, producing a negative gap that has no
+# meaningful interpretation. They are removed here before any downstream
+# analysis, as they would also produce NaN values under log transformation.
+
+cat("── Rows with payment_gap <= 0 (removed) ──\n")
+cat(sum(ma_providers$payment_gap <= 0), "\n")
+
+ma_providers <- ma_providers %>%
+  filter(payment_gap > 0)
+
+cat("── Remaining MA provider rows after filter ──\n")
+cat(nrow(ma_providers), "\n")
+
+# ──Payment gap data summary ──────────────────────────────────
+cat("\n── Payment Gap Summary (MA) ──\n")
+summary(ma_providers$payment_gap)
+```
+
+------------------------------------------------------------------------
+
+# Part 2: specialties exploration
+
+::: fill-box
+**Specialties of Massachussets providers:**
+
+We identify the different provider specialties to investigate the impact they may have on the payment gap.
+
+**Why?** Provider specialty, is categorical with multiple levels, and the goal is to test whether group means differ simultaneously rather than through a series of pairwise comparisons. The analysis focuses on the top 10 specialties by provider count to ensure adequate group sizes for assumption checking.
+
+**The approach:**
+
+1. Count the number of distinct specialties in the dataset
+2. Find the Top 10 specialties by provider count
+:::
+
+```{r p2-specialties-exploration}
+# Provider specialties — categorical variable for ANOVA
+# ── Step 1: Distinct specialties count ──────────────────────────────────────────────────────
+cat("\n── Number of unique specialties ──\n")
+cat(length(unique(ma_providers$Rndrng_Prvdr_Type)), "\n")
+
+# ── Step 2: Top 10 specialties by provider count ────────────────────────────────────────────
+cat("\n── Top 10 specialties by provider count ──\n")
+ma_providers %>%
+  count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+  head(10) %>%
+  print()
+
+# ── Step 3: Top 20 specialties by provider count ────────────────────────────────────────────
+cat("\n── Top 10 specialties by provider count ──\n")
+ma_providers %>%
+  count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+  head(20) %>%
+  print()
+```
+
+------------------------------------------------------------------------
+
+# Part 3: missing values check
+
+::: why-box
+**Why check for missing values?**
+
+Before any inferential analysis, it is essential to confirm that the
+key variables contain no missing entries. Missing values in outcome
+variables such as `payment_gap` or in predictors such as
+`Bene_Avg_Risk_Scre` would silently drop observations from regression
+models, potentially introducing selection bias. The check below covers
+every variable that enters the regression, ANOVA, logistic regression,
+or permutation test.
+
+`srvcs_per_bene` receives a separate `NaN` check in addition to the
+standard `NA` check. Because it is a derived ratio (`Tot_Srvcs /
+Tot_Benes`), any row where `Tot_Benes` is zero would produce `NaN`
+rather than `NA` — R's division-by-zero result for numeric vectors.
+Standard `is.na()` returns `TRUE` for `NaN`, so the count below will
+catch both, but the explicit `is.nan()` check makes the distinction
+visible and confirms whether the issue is upstream missing data or a
+zero-beneficiary edge case that may warrant filtering before modelling.
+
+CMS suppresses chronic condition prevalence values (`Bene_CC_*`) when
+fewer than 11 beneficiaries with that condition were observed for a
+given provider. Missingness in these variables is therefore not
+random --- it is systematically more likely for providers with small
+patient panels or rare specialties. The investigation below checks
+whether missing values cluster among low-volume providers, which would
+confirm the suppression mechanism and guide the handling strategy for
+downstream analyses.
+:::
+
+```{r p3-missing-values}
+cat("── Total MA provider rows ──\n")
+cat(nrow(ma_providers), "\n")
+
+cat("\n── Missing values in key non-CC variables ──\n")
+ma_providers %>%
+  dplyr::select(
+    payment_gap,
+    Tot_Sbmtd_Chrg,
+    Tot_Mdcr_Stdzd_Amt,
+    Tot_Benes,
+    Tot_Srvcs,
+    srvcs_per_bene,
+    Rndrng_Prvdr_Type,
+    Rndrng_Prvdr_RUCA_Desc,
+    Bene_Avg_Age,
+    Bene_Avg_Risk_Scre
+  ) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  tidyr::pivot_longer(everything(),
+    names_to  = "variable",
+    values_to = "n_missing"
+  ) %>%
+  print()
+
+cat("\n── NaN check for srvcs_per_bene (division-by-zero guard) ──\n")
+cat("NaN count:", sum(is.nan(ma_providers$srvcs_per_bene)), "\n")
+cat("NA count: ", sum(is.na(ma_providers$srvcs_per_bene)),  "\n")
+
+cat("\n── Missing values in all Bene_CC_* variables (with % of total rows) ──\n")
+ma_providers %>%
+  dplyr::select(starts_with("Bene_CC_")) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  tidyr::pivot_longer(everything(),
+    names_to  = "variable",
+    values_to = "n_missing"
+  ) %>%
+  mutate(pct_missing = round(n_missing / nrow(ma_providers) * 100, 1)) %>%
+  arrange(desc(n_missing)) %>%
+  print(n = Inf)
+```
+
+```{r p3-missingness-investigation}
+# Flag providers with at least one missing Bene_CC_* value
+ma_providers <- ma_providers %>%
+  mutate(any_cc_missing = if_any(starts_with("Bene_CC_"), is.na))
+
+cat("── Providers with at least one missing Bene_CC_* value ──\n")
+table(ma_providers$any_cc_missing)
+
+cat("\n── Tot_Benes distribution: complete vs incomplete CC rows ──\n")
+ma_providers %>%
+  group_by(any_cc_missing) %>%
+  summarise(
+    n            = n(),
+    median_benes = median(Tot_Benes),
+    mean_benes   = round(mean(Tot_Benes), 1),
+    p25_benes    = quantile(Tot_Benes, 0.25),
+    p75_benes    = quantile(Tot_Benes, 0.75)
+  ) %>%
+  print()
+
+ggplot(ma_providers, aes(x = log(Tot_Benes), fill = any_cc_missing)) +
+  geom_histogram(bins = 50, position = "identity", alpha = 0.6) +
+  scale_fill_manual(
+    values = c("FALSE" = "#2166AC", "TRUE" = "#C8102E"),
+    labels = c("FALSE" = "Complete CC", "TRUE" = "Any CC missing")
+  ) +
+  labs(
+    title    = "Beneficiary Count Distribution by CC Missingness",
+    subtitle = "Missing CC values clustering at low Tot_Benes confirms CMS suppression",
+    x        = "log(Tot_Benes)",
+    y        = "Count",
+    fill     = NULL
+  )
+```
+
+------------------------------------------------------------------------
+
+# Part 4: chronic condition prevalence validation
+
+::: why-box
+**Why validate the `Bene_CC_*` range?**
+
+The chronic condition prevalence variables are percentages derived from
+CMS beneficiary records. Two CMS privacy protection rules shape the
+expected range of these variables.
+
+First, prevalence values are suppressed entirely (`NA`) when fewer than
+11 beneficiaries with that condition were observed for a given provider
+--- the mechanism identified in Part 3.
+
+Second, values between 75% and 100% are top-coded at 75%. A provider
+whose patient panel is, say, 90% diabetic will have that figure
+reported as 75%. This prevents re-identification of providers with very
+small, homogeneous patient panels.
+
+The valid range for non-suppressed values is therefore **[0, 75]**,
+not [0, 1] or [0, 100]. A maximum of exactly 75 across all variables
+is expected and confirms CMS top-coding is applied consistently. Any
+value above 75 would indicate a data encoding error. This check is a
+precondition for the use of these variables in the regression analysis
+(RQ1) and serves as documentation of a known ceiling effect that
+slightly compresses the upper tail of the chronic condition
+distributions.
+:::
+
+```{r p4-chronic-condition-validation}
+cc_vars <- ma_providers %>%
+  dplyr::select(starts_with("Bene_CC_"))
+
+cat("\n── Chronic condition prevalence variables: range check ──\n")
+cc_vars %>%
+  summarise(across(everything(), list(
+    min  = ~min(., na.rm = TRUE),
+    max  = ~max(., na.rm = TRUE)
+  ))) %>%
+  tidyr::pivot_longer(everything(),
+    names_to  = c("variable", ".value"),
+    names_sep = "_(?=[^_]+$)"
+  ) %>%
+  print(n = Inf)
+```
+------------------------------------------------------------------------
+
+# Part 5: payment gap distribution
+
+::: pattern-box
+**What to look for:**
+
+The raw payment gap distribution is expected to be heavily right-skewed
+— a small number of high-volume specialists submit very large charges
+relative to Medicare reimbursement, pulling the tail far to the right.
+This skew motivates using the log-transformed gap as the outcome in the
+multiple regression (RQ1) and justifies bootstrap rather than
+parametric confidence intervals for the permutation test (RQ4).
+:::
+
+
+```{r p5-payment-gap-distribution, fig.cap="Distribution of Medicare payment gaps for Massachusetts providers (2023). The distribution is heavily right-skewed — the x-axis is capped at the 95th percentile for visibility, with the remaining 5% of providers extending well beyond this range."}
+
+p95 <- quantile(ma_providers$payment_gap, 0.95)
+
+ggplot(ma_providers, aes(x = payment_gap)) +
+  geom_histogram(bins = 60, fill = "#2166AC", alpha = 0.8) +
+  scale_x_continuous(
+    labels = scales::dollar,
+    limits = c(0, p95)
+  ) +
+  labs(
+    title    = "Distribution of Medicare Payment Gaps — Massachusetts Providers",
+    subtitle = paste0("Capped at 95th percentile ($",
+                      scales::comma(round(p95)),
+                      ")\nHeavy right skew motivates log transformation"),
+    x        = "Payment Gap ($)",
+    y        = "Count"
+  )
+```
+```{r p5-payment-log-gap-distribution, fig.cap="Distribution of Medicare payment gaps for Massachusetts providers (2023). Heavy right skew is visible on the log scale and motivates log transformation for regression analyses."}
+ggplot(ma_providers, aes(x = payment_gap)) +
+  geom_histogram(bins = 60, fill = "#2166AC", alpha = 0.8) +
+  scale_x_log10(labels = scales::dollar) +
+  labs(
+    title    = "Distribution of Medicare Payment Gaps — Massachusetts Providers",
+    subtitle = "CMS Physician & Other Practitioners dataset, 2023 (log scale)",
+    x        = "Payment Gap ($, log scale)",
+    y        = "Count"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Part 6: Motivation for quantile regression
+
+::: why-box
+**Why examine quantile regression before fitting OLS?**
+Multiple linear regression estimates a single coefficient per predictor
+— the average effect of that predictor across all providers. This
+average is meaningful only if the effect is roughly uniform across the
+payment gap distribution. If billing intensity, for example, drives the
+gap more strongly among low-gap providers than high-gap ones, OLS will
+split the difference and miss that heterogeneity entirely.
+
+These exploratory plots overlay univariate quantile regression fits at
+Q25, Q50, and Q75 on the raw scatter of log(payment_gap) against each
+predictor. The Q25 line traces the relationship for providers in the
+bottom quarter of the gap distribution at each level of the predictor;
+the Q75 line does the same for providers in the top quarter. If the
+three lines are parallel and equally spaced, OLS is telling the
+complete story. If they fan out, converge, or diverge in slope, that
+is visual evidence that the predictor behaves differently across the
+distribution — and that quantile regression will reveal something OLS
+cannot.
+
+**Note:** These are univariate fits for visualization purposes only.
+The full multivariate quantile regression results are reported
+after Model 1.
+:::
+
+::: pattern-box
+**What to look for:**
+
+For **log(Tot_Benes)**: if the quantile lines converge as volume
+increases — Q25 and Q75 drawing closer together at high volume — this
+suggests that among high-volume providers the gap distribution is
+tighter and more predictable from volume alone. Among low-volume
+providers, other factors drive larger spread in the gap, which is
+consistent with the heteroscedasticity observed in the Model 1
+diagnostic plots.
+
+For **log(srvcs_per_bene)**: parallel quantile lines with large
+vertical separation between Q25 and Q75 would suggest that billing
+intensity shifts the gap level uniformly across the distribution, but
+does not explain why some providers are structurally high-gap and
+others low-gap. A narrowing or crossing of lines would indicate
+differential effects worth investigating in the full multivariate
+quantile regression.
+
+In both cases, the OLS line is shown as a dotted reference. Quantile
+lines that stray away from the OLS line confirm that the single average
+estimate is insufficient to characterize the full relationship between
+each predictor and the payment gap.
+:::
+
+```{r p6-quantile-motivation}
+
+# Fit quantile regression lines at Q25, Q50, Q75
+# and OLS for comparison — on log(payment_gap) ~ log(Tot_Benes)
+qr_25 <- rq(log(payment_gap) ~ log(Tot_Benes), tau = 0.25, data = ma_providers)
+qr_50 <- rq(log(payment_gap) ~ log(Tot_Benes), tau = 0.50, data = ma_providers)
+qr_75 <- rq(log(payment_gap) ~ log(Tot_Benes), tau = 0.75, data = ma_providers)
+ols   <- lm(log(payment_gap) ~ log(Tot_Benes), data = ma_providers)
+
+# Build prediction grid
+benes_grid <- data.frame(
+  Tot_Benes = exp(seq(
+    min(log(ma_providers$Tot_Benes)),
+    max(log(ma_providers$Tot_Benes)),
+    length.out = 300
+  ))
+)
+
+pred_df <- benes_grid %>%
+  mutate(
+    q25 = predict(qr_25, newdata = benes_grid),
+    q50 = predict(qr_50, newdata = benes_grid),
+    q75 = predict(qr_75, newdata = benes_grid),
+    ols = predict(ols,   newdata = benes_grid)
+  ) %>%
+  pivot_longer(cols = c(q25, q50, q75, ols),
+               names_to = "model", values_to = "fitted_log_gap")
+
+# Sample points to avoid overplotting (5,000 random providers)
+set.seed(6105)
+plot_sample <- ma_providers %>% sample_n(5000)
+
+ggplot() +
+  geom_point(
+    data  = plot_sample,
+    aes(x = log(Tot_Benes), y = log(payment_gap)),
+    alpha = 0.15, size = 0.6, colour = "grey50"
+  ) +
+  geom_line(
+    data = pred_df,
+    aes(x = log(Tot_Benes), y = fitted_log_gap,
+        colour = model, linetype = model),
+    linewidth = 0.9
+  ) +
+  scale_colour_manual(
+    values = c(
+      q25 = "#2166AC",
+      q50 = "#4DAC26",
+      q75 = "#D01C8B",
+      ols = "#E66101"
+    ),
+    labels = c(
+      q25 = "Q25 (quantile reg)",
+      q50 = "Q50 (quantile reg)",
+      q75 = "Q75 (quantile reg)",
+      ols = "OLS (mean)"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(q25 = "dashed", q50 = "solid", q75 = "dashed", ols = "dotted"),
+    labels = c(
+      q25 = "Q25 (quantile reg)",
+      q50 = "Q50 (quantile reg)",
+      q75 = "Q75 (quantile reg)",
+      ols = "OLS (mean)"
+    )
+  ) +
+  labs(
+    title    = "Payment Gap vs Provider Volume: Quantile vs OLS Fit",
+    subtitle = "Fanning of quantile lines suggests heterogeneous volume effect across the gap distribution",
+    x        = "log(Tot_Benes)",
+    y        = "log(Payment Gap $)",
+    colour   = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40"),
+    legend.position = "bottom"
+  )
+
+ggsave(
+  here::here("docs", "figures", "quantile_motivation.png"),
+  width = 8, height = 5, dpi = 300
+)
+```
+
+
+```{r p6-quantile-motivation-srvcs}
+# Same plot for log(srvcs_per_bene)
+qr_25_s <- rq(log(payment_gap) ~ log(srvcs_per_bene), tau = 0.25, data = ma_providers)
+qr_50_s <- rq(log(payment_gap) ~ log(srvcs_per_bene), tau = 0.50, data = ma_providers)
+qr_75_s <- rq(log(payment_gap) ~ log(srvcs_per_bene), tau = 0.75, data = ma_providers)
+ols_s   <- lm(log(payment_gap) ~ log(srvcs_per_bene), data = ma_providers)
+
+srvcs_grid <- data.frame(
+  srvcs_per_bene = exp(seq(
+    min(log(ma_providers$srvcs_per_bene)),
+    max(log(ma_providers$srvcs_per_bene)),
+    length.out = 300
+  ))
+)
+
+pred_df_s <- srvcs_grid %>%
+  mutate(
+    q25 = predict(qr_25_s, newdata = srvcs_grid),
+    q50 = predict(qr_50_s, newdata = srvcs_grid),
+    q75 = predict(qr_75_s, newdata = srvcs_grid),
+    ols = predict(ols_s,   newdata = srvcs_grid)
+  ) %>%
+  pivot_longer(cols = c(q25, q50, q75, ols),
+               names_to = "model", values_to = "fitted_log_gap")
+
+set.seed(6105)
+plot_sample_s <- ma_providers %>% sample_n(5000)
+
+ggplot() +
+  geom_point(
+    data  = plot_sample_s,
+    aes(x = log(srvcs_per_bene), y = log(payment_gap)),
+    alpha = 0.15, size = 0.6, colour = "grey50"
+  ) +
+  geom_line(
+    data = pred_df_s,
+    aes(x = log(srvcs_per_bene), y = fitted_log_gap,
+        colour = model, linetype = model),
+    linewidth = 0.9
+  ) +
+  scale_colour_manual(
+    values = c(
+      q25 = "#2166AC",
+      q50 = "#4DAC26",
+      q75 = "#D01C8B",
+      ols = "#E66101"
+    ),
+    labels = c(
+      q25 = "Q25 (quantile reg)",
+      q50 = "Q50 (quantile reg)",
+      q75 = "Q75 (quantile reg)",
+      ols = "OLS (mean)"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(q25 = "dashed", q50 = "solid", q75 = "dashed", ols = "dotted"),
+    labels = c(
+      q25 = "Q25 (quantile reg)",
+      q50 = "Q50 (quantile reg)",
+      q75 = "Q75 (quantile reg)",
+      ols = "OLS (mean)"
+    )
+  ) +
+  labs(
+    title    = "Payment Gap vs Billing Intensity: Quantile vs OLS Fit",
+    subtitle = "Fanning of quantile lines would suggest heterogeneous billing intensity effect across the gap distribution",
+    x        = "log(srvcs_per_bene)",
+    y        = "log(Payment Gap $)",
+    colour   = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(size = 13),
+    plot.subtitle   = element_text(size = 10, colour = "grey40"),
+    legend.position = "bottom"
+  )
+
+ggsave(
+  here::here("docs", "figures", "quantile_motivation_srvcs.png"),
+  width = 8, height = 5, dpi = 300
+)
+```
+
+------------------------------------------------------------------------
+
+# Part 7: payment gap by provider specialty
+
+::: why-box
+**Why compare payment gap across specialties?**
+
+Provider specialty is the categorical grouping variable for the ANOVA
+(RQ2). The boxplot below gives an early visual indication of whether
+the group means differ meaningfully, and whether variance is
+approximately homogeneous across groups — an assumption the Levene test
+will formally assess later. Only the top 8 specialties by provider
+count are shown to ensure each box represents an adequately sized group.
+The log scale is applied here for visual clarity, since raw gap values
+compress all boxes toward zero.
+:::
+
+```{r p7-gap-by-specialty, fig.cap="Payment gap by provider specialty (log scale). Specialties are ordered by median log payment gap. Only the top 8 by provider count are displayed."}
+ma_providers %>%
+  count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+  head(10) %>%
+  inner_join(ma_providers, by = "Rndrng_Prvdr_Type") %>%
+  ggplot(aes(x    = reorder(Rndrng_Prvdr_Type, payment_gap, median),
+             y    = log(payment_gap))) +
+  geom_boxplot(fill = "#2166AC", outlier.alpha = 0.3, outlier.size = 0.8) +
+  coord_flip() +
+  labs(
+    title    = "Payment Gap by Provider Specialty",
+    subtitle = "Massachusetts Medicare Providers, 2023 (log scale)",
+    x        = "Specialty",
+    y        = "log(Payment Gap $)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(size = 13),
+    plot.subtitle = element_text(size = 10),
+    axis.text.y   = element_text(size = 9)
+  )
+```
+
+```{r p7-hcpcs-by-specialty}
+cat("── Median distinct HCPCS codes by specialty — top 20 by gap ──\n")
+ma_providers %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    n                 = n(),
+    median_gap        = median(payment_gap),
+    median_hcpcs      = median(Tot_HCPCS_Cds),
+    mean_hcpcs        = round(mean(Tot_HCPCS_Cds), 1),
+    .groups           = "drop"
+  ) %>%
+  arrange(desc(median_gap)) %>%
+  head(20) %>%
+  mutate(median_gap = scales::dollar(round(median_gap, 0))) %>%
+  print()
+
+cat("\n── Median distinct HCPCS codes — bottom 10 by gap ──\n")
+ma_providers %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    n                 = n(),
+    median_gap        = median(payment_gap),
+    median_hcpcs      = median(Tot_HCPCS_Cds),
+    mean_hcpcs        = round(mean(Tot_HCPCS_Cds), 1),
+    .groups           = "drop"
+  ) %>%
+  arrange(median_gap) %>%
+  head(10) %>%
+  mutate(median_gap = scales::dollar(round(median_gap, 0))) %>%
+  print()
+```
+------------------------------------------------------------------------
+
+# Part 8: high-gap binary variable and geographic distribution
+
+::: fill-box
+**Defining high-gap providers:**
+
+A binary outcome variable `high_gap` is constructed by dichotomising
+the payment gap at its median. Providers above the median are coded 1
+(high gap) and those at or below are coded 0. This variable serves as
+the outcome for the logistic regression (RQ3) and as the grouping
+variable in the permutation test (RQ4).
+
+**Why the median?** Using the sample median rather than an external or
+theoretically motivated threshold ensures balanced classes, which
+improves the stability of logistic regression coefficient estimates and
+gives the permutation test comparable group sizes.
+:::
+
+```{r p8-high-gap-binary}
+ma_providers <- ma_providers %>%
+  mutate(high_gap = ifelse(payment_gap > median(payment_gap), 1, 0))
+
+cat("──median payment gap──\n")
+median(ma_providers$payment_gap)
+
+cat("── high_gap distribution ──\n")
+table(ma_providers$high_gap)
+```
+
+```{r p8-summary-stats-by-provider}
+ma_providers %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    n = n(),
+    median_gap = median(payment_gap),
+    mean_log_gap = mean(log(payment_gap))
+  ) %>%
+  arrange(desc(median_gap))
+
+
+ma_providers %>%
+  filter(Rndrng_Prvdr_Type %in% (
+    ma_providers %>%
+      count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+      head(10) %>%
+      pull(Rndrng_Prvdr_Type)
+  )) %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    n          = n(),
+    median_gap = round(median(payment_gap)),
+    mean_gap   = round(mean(payment_gap)),
+    p25_gap    = round(quantile(payment_gap, 0.25)),
+    p75_gap    = round(quantile(payment_gap, 0.75))
+  ) %>%
+  arrange(desc(median_gap)) %>%
+  print()
+
+
+top10_specialties <- ma_providers %>%
+  count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+  head(10) %>%
+  pull(Rndrng_Prvdr_Type)
+
+ma_top10 <- ma_providers %>%
+  filter(Rndrng_Prvdr_Type %in% top10_specialties)
+
+leveneTest(log(payment_gap) ~ Rndrng_Prvdr_Type, data = ma_top10)
+
+
+ma_top10 %>%
+  group_by(Rndrng_Prvdr_Type) %>%
+  summarise(
+    n            = n(),
+    mean_log_gap = round(mean(log(payment_gap)), 3),
+    sd_log_gap   = round(sd(log(payment_gap)), 3)
+  ) %>%
+  arrange(desc(mean_log_gap))
+```
+
+::: why-box
+**Why a rural/urban geographic comparison is not viable for this dataset:**
+
+The original research design planned to use RUCA codes to construct a
+binary rural/urban indicator and test whether location affects the odds
+of being a high-gap provider (RQ3) and whether the median payment gap
+differs between rural and urban providers (RQ4). The provider count by
+RUCA category below reveals that this comparison is not meaningful for
+Massachusetts.
+
+Over 98% of providers are located in metropolitan area core ZIP codes.
+The remaining groups --- micropolitan, small town, and rural --- contain
+between 3 and 361 providers each. Comparing a group of 36,927 providers
+against groups of this size would yield no meaningful statistical power
+and any detected difference would be uninterpretable given the extreme
+class imbalance.
+:::
+
+```{r p8-ruca-count}
+cat("── Provider count by RUCA classification ──\n")
+ma_providers %>%
+  count(Rndrng_Prvdr_RUCA_Desc, sort = TRUE) %>%
+  print(n = Inf)
+```
+------------------------------------------------------------------------
+
+# Part 9: RQ3/RQ4 variable preparation
+
+::: fill-box
+**Variables required for the logistic regression (RQ3) and permutation
+test (RQ4):**
+
+Two derived variables are computed here before missingness handling and
+distribution checks.
+
+`pct_dual = Bene_Dual_Cnt / Tot_Benes` captures the proportion of a
+provider's patient panel that is dually enrolled in Medicare and
+Medicaid. Dual-eligible beneficiaries are both elderly or disabled and
+low-income, making this variable a proxy for patient social
+vulnerability that is conceptually distinct from clinical complexity as
+measured by `Bene_Avg_Risk_Scre`.
+
+`pct_drug = Drug_Sbmtd_Chrg / Tot_Sbmtd_Chrg` captures the proportion
+of a provider's total submitted charges that are drug-related. As the
+distribution analysis below reveals, this variable is heavily
+zero-inflated --- the vast majority of providers bill no drugs at all
+--- and is therefore converted to a binary indicator `drug_provider`
+before entering the logistic regression and permutation test.
+:::
+
+```{r p9-derive-variables}
+ma_providers <- ma_providers %>%
+  mutate(
+    pct_dual = Bene_Dual_Cnt / Tot_Benes,
+    pct_drug = Drug_Sbmtd_Chrg / Tot_Sbmtd_Chrg
+  )
+```
+
+------------------------------------------------------------------------
+
+## Missing value handling: `pct_drug`
+
+::: why-box
+**Why zero-impute `pct_drug`?**
+
+`Drug_Sbmtd_Chrg` is missing for 3,403 providers. Unlike the CMS
+suppression mechanism that affects `Bene_CC_*` and `Bene_Dual_Cnt` ---
+where missingness reflects small cell sizes --- missing
+`Drug_Sbmtd_Chrg` indicates that the provider submitted no drug charges
+whatsoever during 2023. There is no ambiguity here: a provider with no
+drug billing record has a drug charge proportion of exactly zero. This
+is not an imputation assumption but a logical consequence of the data
+structure. Replacing `NA` with 0 is therefore the correct encoding
+rather than a missing data workaround.
+
+Following zero-imputation, `pct_drug` is converted to a binary
+indicator `drug_provider` (1 = any drug charges, 0 = no drug charges).
+The distribution of `pct_drug` is so heavily zero-inflated that
+treating it as a continuous predictor would provide almost no usable
+variance in the logistic regression. The binary encoding asks a cleaner
+and more interpretable question: does billing any drugs at all affect
+the odds of being a high-gap provider, and does it produce a
+structurally distinct median payment gap in the permutation test?
+:::
+
+```{r p9-pct-drug-impute}
+ma_providers <- ma_providers %>%
+  mutate(
+    pct_drug     = ifelse(is.na(pct_drug), 0, pct_drug),
+    drug_provider = ifelse(pct_drug > 0, 1, 0)
+  )
+
+cat("── drug_provider distribution ──\n")
+ma_providers %>%
+  count(drug_provider) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  print()
+```
+
+------------------------------------------------------------------------
+
+## Missing value handling: `pct_dual`
+
+::: why-box
+**Why complete-case analysis for `pct_dual`?**
+
+`Bene_Dual_Cnt` is missing for 9,152 providers (~25% of the dataset),
+following the same CMS suppression pattern identified in Part 3 for
+`Bene_CC_*` variables: providers with fewer than 11 dual-eligible
+beneficiaries have the count suppressed. Unlike `pct_drug`, where
+missingness unambiguously implies zero, a suppressed dual count does
+not mean zero dual-eligible patients --- it means too few to report
+reliably. Zero-imputation would therefore misrepresent the true
+dual-eligibility burden for these providers.
+
+Complete-case analysis is adopted instead: the 9,152 providers with
+missing `Bene_Dual_Cnt` are excluded from the RQ3 logistic regression
+and RQ4 permutation test, retaining 28,556 providers. This is a large
+and analytically sufficient sample. Importantly, the missingness
+investigation in Part 3 confirms that missing providers are
+systematically low-volume (median 31 beneficiaries vs 214 for complete
+cases), so the complete-case dataset represents providers with
+meaningful patient panels for whom dual eligibility is a well-defined
+and reliably measured characteristic. RQ1 and RQ2 are unaffected and
+retain the full dataset.
+:::
+
+```{r p9-pct-dual-complete-case}
+ma_providers_rq3 <- ma_providers %>%
+  filter(!is.na(pct_dual))
+
+cat("── RQ3/RQ4 analysis dataset ──\n")
+cat("Rows retained:", nrow(ma_providers_rq3), "\n")
+cat("Rows excluded:", nrow(ma_providers) - nrow(ma_providers_rq3), "\n")
+```
+
+------------------------------------------------------------------------
+
+## Distribution checks
+
+```{r p9-entity-code}
+cat("── Rndrng_Prvdr_Ent_Cd distribution ──\n")
+ma_providers_rq3 %>%
+  count(Rndrng_Prvdr_Ent_Cd) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  print()
+```
+
+```{r p9-pct-dual-summary, fig.cap="Distribution of dual eligibility proportion among providers with non-suppressed Bene_Dual_Cnt (n = 28,556). Right skew with a spike at 100% indicates most providers serve moderate proportions of dual-eligible patients, with a small subset serving exclusively dual-eligible panels."}
+cat("── pct_dual summary ──\n")
+summary(ma_providers_rq3$pct_dual)
+
+ggplot(ma_providers_rq3, aes(x = pct_dual)) +
+  geom_histogram(bins = 50, fill = "#2166AC", alpha = 0.8) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title    = "Distribution of Dual Eligibility Proportion — Massachusetts Providers",
+    subtitle = "Complete cases only (n = 28,556); pct_dual = Bene_Dual_Cnt / Tot_Benes",
+    x        = "% Dual-Eligible Beneficiaries",
+    y        = "Count"
+  )
+```
+
+```{r p9-pct-drug-summary, fig.cap="Distribution of drug charge proportion after zero-imputation (n = 37,708). The near-complete concentration at zero confirms the binary drug_provider encoding is the appropriate representation for this variable."}
+cat("── pct_drug summary (after zero-imputation) ──\n")
+summary(ma_providers$pct_drug)
+
+ggplot(ma_providers, aes(x = pct_drug)) +
+  geom_histogram(bins = 50, fill = "#2166AC", alpha = 0.8) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title    = "Distribution of Drug Charge Proportion — Massachusetts Providers",
+    subtitle = "After zero-imputation; pct_drug = Drug_Sbmtd_Chrg / Tot_Sbmtd_Chrg",
+    x        = "% Drug-Related Submitted Charges",
+    y        = "Count"
+  )
+
+# High gap rate by drug_provider
+ma_providers_rq3 %>%
+  group_by(drug_provider) %>%
+  summarise(
+    n            = n(),
+    pct_high_gap = round(mean(high_gap) * 100, 1)
+  )
+
+# Numeric predictor summaries by high_gap
+ma_providers_rq3 %>%
+  group_by(high_gap) %>%
+  summarise(
+    median_benes     = median(Tot_Benes),
+    median_srvcs     = round(median(srvcs_per_bene), 2),
+    median_risk      = round(median(Bene_Avg_Risk_Scre), 3),
+    median_dual      = round(median(pct_dual), 3),
+    median_hcpcs     = median(Tot_HCPCS_Cds)
+  )
+```
+```{r p9-hcpcs-summary}
+cat("── Tot_HCPCS_Cds summary ──\n")
+summary(ma_providers_rq3$Tot_HCPCS_Cds)
+
+cat("── Tot_Benes summary ──\n")
+summary(ma_providers_rq3$Tot_Benes)
+
+cat("── srvcs_per_bene summary ──\n")
+summary(ma_providers_rq3$srvcs_per_bene)
+
+cat("\n── Tot_HCPCS_Cds distribution by high_gap ──\n")
+ma_providers_rq3 %>%
+  group_by(high_gap) %>%
+  summarise(
+    n       = n(),
+    median  = median(Tot_HCPCS_Cds),
+    mean    = round(mean(Tot_HCPCS_Cds), 1),
+    p25     = quantile(Tot_HCPCS_Cds, 0.25),
+    p75     = quantile(Tot_HCPCS_Cds, 0.75),
+    .groups = "drop"
+  ) %>%
+  print()
+
+ggplot(ma_providers_rq3, aes(x = log(Tot_HCPCS_Cds + 1))) +
+  geom_histogram(bins = 50, fill = "#2166AC", alpha = 0.8) +
+  labs(
+    title    = "Distribution of Tot_HCPCS_Cds — Massachusetts Providers",
+    subtitle = "RQ3/RQ4 dataset (n = 28,556); log scale",
+    x        = "log(Tot_HCPCS_Cds + 1)",
+    y        = "Count"
+  )
+```
+
+```{r p9-pct_dual-exploration}
+# Distribution of pct_dual by high_gap
+ma_providers_rq3 %>%
+  group_by(high_gap) %>%
+  summarise(
+    n       = n(),
+    median  = round(median(pct_dual), 3),
+    mean    = round(mean(pct_dual), 3),
+    p25     = round(quantile(pct_dual, 0.25), 3),
+    p75     = round(quantile(pct_dual, 0.75), 3)
+  )
+
+# Split pct_dual at median and compare payment gap
+ma_providers_rq3 %>%
+  mutate(high_dual = ifelse(pct_dual > median(pct_dual), 
+                            "High dual", "Low dual")) %>%
+  group_by(high_dual) %>%
+  summarise(
+    n          = n(),
+    median_gap = round(median(payment_gap)),
+    mean_gap   = round(mean(payment_gap)),
+    p25_gap    = round(quantile(payment_gap, 0.25)),
+    p75_gap    = round(quantile(payment_gap, 0.75))
+  )
+
+ma_providers_rq3 %>%
+  mutate(high_dual = ifelse(pct_dual > median(pct_dual),
+                            "High dual-eligibility", 
+                            "Low dual-eligibility")) %>%
+  ggplot(aes(x = high_dual, y = log(payment_gap), fill = high_dual)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.8) +
+  scale_fill_manual(values = c("#2166AC", "#C8102E")) +
+  labs(
+    title    = "Payment Gap by Dual Eligibility Burden",
+    subtitle = "Split at median pct_dual — RQ4 analysis dataset (n = 28,556)",
+    x        = NULL,
+    y        = "log(Payment Gap $)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+::: why-box
+**Why examine pct\_dual as a continuous predictor?**
+RQ4 splits providers at the median \texttt{pct\_dual} into two equal
+groups and compares their median payment gaps. This binary split is
+analytically convenient but raises a question: does the median cutoff
+mask a more complex underlying relationship? If the association
+between dual-eligibility burden and the payment gap is non-linear ---
+for example, if it accelerates above a certain threshold or is flat
+for most of the range and only kicks in at the extremes --- the
+binary comparison would give a misleading picture of the true
+relationship.
+
+This plot examines \texttt{pct\_dual} as a continuous predictor of
+\texttt{log(payment\_gap)} using univariate quantile regression at
+Q25, Q50, and Q75, alongside an OLS reference line. If the lines are
+straight and parallel across the full range of \texttt{pct\_dual},
+the relationship is linear and uniform --- and the median split was
+a reasonable representation of it. If the lines curve or fan out,
+the binary split was hiding something more complex.
+:::
+
+::: fill-box
+**Reading the continuous pct\_dual plot:**
+Each grey dot is one provider from a random sample of 5,000. The
+x-axis shows the proportion of dual-eligible beneficiaries in a
+provider's patient panel, ranging from 0\% (no dual-eligible
+patients) to 100\% (all patients are dual-eligible). The y-axis
+shows the log payment gap.
+
+The four lines summarise the relationship at different parts of the
+gap distribution. Q25 (blue dashed) traces providers in the bottom
+quarter of the conditional gap distribution at each level of
+\texttt{pct\_dual}; Q75 (pink dashed) traces providers in the top
+quarter; Q50 (green solid) traces typical providers; and OLS (orange
+dotted) traces the conditional mean.
+
+**What to look for:** straight parallel lines indicate a linear,
+uniform relationship --- the same slope at every quantile, meaning
+dual-eligibility burden shifts the gap distribution downward by the
+same amount regardless of where a provider sits in the distribution.
+Curved lines would indicate non-linearity. Diverging or converging
+lines would indicate that the effect differs between low-gap and
+high-gap providers.
+:::
+
+```{r p9-pct-dual-continuous-exploration}
+library(quantreg)
+library(ggrepel)
+
+# Sample for plotting to avoid overplotting
+set.seed(6105)
+plot_sample <- ma_providers_rq3 %>% sample_n(5000)
+
+# Fit univariate quantile regression lines for motivation
+qr_25_d <- rq(log(payment_gap) ~ pct_dual, tau = 0.25, data = ma_providers_rq3)
+qr_50_d <- rq(log(payment_gap) ~ pct_dual, tau = 0.50, data = ma_providers_rq3)
+qr_75_d <- rq(log(payment_gap) ~ pct_dual, tau = 0.75, data = ma_providers_rq3)
+ols_d   <- lm(log(payment_gap) ~ pct_dual, data = ma_providers_rq3)
+
+# Prediction grid across full range of pct_dual
+dual_grid <- data.frame(pct_dual = seq(0, 1, length.out = 300))
+
+pred_df_d <- dual_grid %>%
+  mutate(
+    q25 = predict(qr_25_d, newdata = dual_grid),
+    q50 = predict(qr_50_d, newdata = dual_grid),
+    q75 = predict(qr_75_d, newdata = dual_grid),
+    ols = predict(ols_d,   newdata = dual_grid)
+  ) %>%
+  pivot_longer(
+    cols      = c(q25, q50, q75, ols),
+    names_to  = "model",
+    values_to = "fitted_log_gap"
+  )
+
+ggplot() +
+  geom_point(
+    data  = plot_sample,
+    aes(x = pct_dual, y = log(payment_gap)),
+    alpha = 0.12, size = 0.6, colour = "grey50"
+  ) +
+  geom_line(
+    data = pred_df_d,
+    aes(x = pct_dual, y = fitted_log_gap,
+        colour = model, linetype = model),
+    linewidth = 0.9
+  ) +
+  scale_colour_manual(
+    values = c(
+      q25 = "#2166AC",
+      q50 = "#4DAC26",
+      q75 = "#D01C8B",
+      ols = "#E66101"
+    ),
+    labels = c(
+      q25 = "Q25 (quantile reg)",
+      q50 = "Q50 (quantile reg)",
+      q75 = "Q75 (quantile reg)",
+      ols = "OLS (mean)"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      q25 = "dashed",
+      q50 = "solid",
+      q75 = "dashed",
+      ols = "dotted"
+    ),
+    labels = c(
+      q25 = "Q25 (quantile reg)",
+      q50 = "Q50 (quantile reg)",
+      q75 = "Q75 (quantile reg)",
+      ols = "OLS (mean)"
+    )
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    breaks = seq(0, 1, by = 0.2)
+  ) +
+  labs(
+    title    = "Payment Gap vs Dual-Eligibility Burden: Quantile vs OLS Fit",
+    subtitle = "Univariate fits — pct_dual as continuous predictor (n = 28,556, sample of 5,000 shown)",
+    x        = "Proportion of dual-eligible beneficiaries (pct_dual)",
+    y        = "log(Payment Gap $)",
+    colour   = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(size = 13),
+    plot.subtitle   = element_text(size = 10, colour = "grey40"),
+    legend.position = "bottom"
+  )
+
+ggsave(
+  here::here("docs", "figures", "pct_dual_continuous_motivation.png"),
+  width = 8, height = 5, dpi = 300
+)
+```
+
+::: pattern-box
+**What the continuous analysis reveals:**
+All four lines are straight and decline consistently from left to
+right across the full range of \texttt{pct\_dual}. There is no
+visible curvature, no threshold effect, and no acceleration at any
+point in the distribution. The relationship between dual-eligibility
+burden and the payment gap is linear throughout.
+
+The lines are also parallel: the vertical separation between Q25 and
+Q75 remains roughly constant across the full range of
+\texttt{pct\_dual}. This means dual-eligibility burden shifts the
+entire payment gap distribution downward uniformly --- it affects
+low-gap and high-gap providers to the same degree. OLS and Q50 are
+nearly identical throughout, confirming that the mean and median
+tell the same story at each level of dual-eligibility burden.
+
+These results justify the binary split used in RQ4. The median
+cutoff was not masking a threshold effect or non-linearity --- it
+was summarising a smooth, linear, and uniform continuous relationship.
+The \$76{,}628 difference in median gaps between low and high
+dual-eligibility providers reflects a consistent gradient that runs
+across the full spectrum of dual-eligibility burden rather than a
+step change at the median.
+:::
+
+------------------------------------------------------------------------
+
+# Part 10: chronic condition variable selection
+
+::: fill-box
+**Two regression analyses for RQ1:**
+
+RQ1 is answered using two complementary models. The first uses the
+full dataset (all ~37,700 providers) with `Bene_Avg_Risk_Scre` and
+`Bene_Avg_Age` as the sole patient complexity controls, since `Bene_CC_*`
+variables are suppressed for ~90% of providers. The second uses only
+the 3,753 providers with complete `Bene_CC_*` data, adding chronic
+condition prevalence variables selected by LASSO as additional
+complexity controls.
+
+Before running LASSO, the complete-CC subset is profiled against the
+full dataset to establish whether it represents a genuinely distinct
+analytical population or simply replicates the high-volume vs
+low-volume split identified in Part 3. If the two groups differ only
+in provider volume, the complete-CC model should be interpreted as a
+high-volume provider analysis rather than a true sensitivity check.
+:::
+
+------------------------------------------------------------------------
+
+## Step 1: profiling the complete-CC subset
+
+```{r p10-profile-complete-cc}
+# Create complete-CC subset
+ma_providers_cc <- ma_providers %>%
+  filter(!any_cc_missing)
+
+cat("── Full dataset vs complete-CC subset ──\n")
+bind_rows(
+  ma_providers %>%
+    summarise(
+      dataset       = "Full",
+      n             = n(),
+      median_benes  = median(Tot_Benes),
+      mean_benes    = round(mean(Tot_Benes), 1),
+      median_gap    = round(median(payment_gap)),
+      mean_gap      = round(mean(payment_gap)),
+      median_risk   = round(median(Bene_Avg_Risk_Scre), 3),
+      median_srvcs  = round(median(srvcs_per_bene), 2)
+    ),
+  ma_providers_cc %>%
+    summarise(
+      dataset       = "Complete CC",
+      n             = n(),
+      median_benes  = median(Tot_Benes),
+      mean_benes    = round(mean(Tot_Benes), 1),
+      median_gap    = round(median(payment_gap)),
+      mean_gap      = round(mean(payment_gap)),
+      median_risk   = round(median(Bene_Avg_Risk_Scre), 3),
+      median_srvcs  = round(median(srvcs_per_bene), 2)
+    )
+) %>%
+  print()
+
+cat("\n── Top 10 specialties: full dataset ──\n")
+ma_providers %>%
+  count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  head(10) %>%
+  print()
+
+cat("\n── Top 10 specialties: complete-CC subset ──\n")
+ma_providers_cc %>%
+  count(Rndrng_Prvdr_Type, sort = TRUE) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  head(10) %>%
+  print()
+```
+
+::: pattern-box
+**Interpretation guidance:**
+
+If the complete-CC subset shows a substantially higher median `Tot_Benes`
+than the full dataset, it confirms that the `Bene_CC_*` completeness
+split is driven by provider volume rather than any independent
+characteristic. In that case the LASSO model should be clearly labelled
+as a high-volume provider analysis in the write-up, and its coefficients
+should not be generalised to the full Massachusetts provider population.
+If the specialty distributions also diverge, that adds further evidence
+that the two models answer subtly different questions about different
+provider subpopulations.
+:::
+
+------------------------------------------------------------------------
+
+## Step 2: LASSO variable selection
+
+::: why-box
+**Why LASSO rather than PCA?**
+
+Both LASSO and PCA address the multicollinearity among `Bene_CC_*`
+variables, but they do so differently. PCA combines all variables into
+uncorrelated linear components, which eliminates multicollinearity but
+destroys interpretability --- the components cannot be mapped back to
+specific chronic conditions. LASSO applies an L1 penalty that shrinks
+some coefficients exactly to zero, retaining a sparse set of original
+variables. Because RQ1 explicitly asks which factors have the strongest
+independent effect, LASSO is the appropriate tool: it preserves the
+ability to attribute effects to specific chronic conditions while
+controlling for multicollinearity through variable elimination.
+
+LASSO is run on the complete-CC subset only. The `lambda.1se` rule is
+used for parsimony --- it selects the simplest model within one
+standard error of the minimum cross-validation error, reducing the risk
+of overfitting on the 3,753-provider subset.
+:::
+
+```{r p10-lasso, fig.cap="Non-zero LASSO coefficients at lambda.1se predicting log(payment_gap) among Massachusetts providers with complete chronic condition data (2023)."}
+
+
+cc_cols <- ma_providers_cc %>%
+  dplyr::select(starts_with("Bene_CC_")) %>%
+  names()
+
+lasso_vars <- c(cc_cols, "Bene_Avg_Risk_Scre", "Bene_Avg_Age", "srvcs_per_bene")
+
+lasso_data <- ma_providers_cc %>%
+  dplyr::select(all_of(lasso_vars), payment_gap) %>%
+  drop_na()
+
+X <- lasso_data %>%
+  dplyr::select(all_of(lasso_vars)) %>%
+  as.matrix()
+
+y <- log(lasso_data$payment_gap)
+
+set.seed(6105)
+cv_lasso <- cv.glmnet(X, y, alpha = 1)
+
+cat("── Optimal lambda (1se rule) ──\n")
+cat(cv_lasso$lambda.1se, "\n")
+
+# ── Build coefficient data frame ──────────────────────────────────────────────
+lasso_coefs <- coef(cv_lasso, s = "lambda.1se") %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("variable") %>%
+  dplyr::rename(coefficient = 2) %>%
+  dplyr::filter(variable != "(Intercept)", coefficient != 0) %>%
+  dplyr::arrange(desc(abs(coefficient))) %>%
+  dplyr::mutate(
+    direction = ifelse(coefficient > 0, "Positive", "Negative"),
+    # Clean up variable names for the axis label
+    label = variable %>%
+      stringr::str_remove("^Bene_CC_") %>%
+      stringr::str_replace_all("_", " ") %>%
+      stringr::str_to_title() %>%
+      dplyr::recode(
+        "Bene Avg Risk Scre" = "Avg Risk Score",
+        "Bene Avg Age"       = "Avg Age",
+        "Srvcs Per Bene"     = "Services per Beneficiary"
+      )
+  )
+
+cat("\n── Non-zero LASSO coefficients (lambda.1se) ──\n")
+print(dplyr::select(lasso_coefs, variable, coefficient))
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+p_lasso <- ggplot(
+  lasso_coefs,
+  aes(
+    x    = reorder(label, coefficient),
+    y    = coefficient,
+    fill = direction
+  )
+) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey40") +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("Positive" = "#2166AC", "Negative" = "#D6604D"),
+    name   = NULL
+  ) +
+  labs(
+    title    = "LASSO-Selected Predictors of log(Payment Gap)",
+    subtitle = paste0(
+      "lambda = ", round(cv_lasso$lambda.1se, 4),
+      "  |  n = ", scales::comma(nrow(lasso_data)), " providers"
+    ),
+    x = NULL,
+    y = "Coefficient"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position  = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey40", size = 10)
+  )
+
+print(p_lasso)
+
+# ── Export ────────────────────────────────────────────────────────────────────
+ggsave(
+  here::here("docs", "figures", "lasso_coefficients.png"),
+  plot   = p_lasso,
+  width  = 7,
+  height = max(4, nrow(lasso_coefs) * 0.45),   # scales height with # of bars
+  dpi    = 300
+)
+```
+
+
+
+------------------------------------------------------------------------
+
+## Step 3: correlation matrix of retained variables
+
+::: why-box
+**Why inspect correlations after LASSO?**
+
+LASSO selects variables independently of their pairwise correlations ---
+it can retain two highly correlated variables if both carry independent
+signal. The correlation matrix below checks whether any retained
+`Bene_CC_*` variables remain strongly correlated with each other
+(|r| > 0.7), which would indicate residual multicollinearity worth
+addressing through further pruning before the regression. Correlations
+with log payment gap also give a first indication of the direction and
+strength of each variable's relationship with the outcome.
+:::
+
+```{r p10-correlation-matrix, fig.cap="Pearson correlation matrix of LASSO-retained chronic condition variables and log payment gap. Values above |0.7| between predictors indicate residual multicollinearity."}
+
+retained_cc <- lasso_coefs %>%
+  filter(str_detect(variable, "Bene_CC_")) %>%
+  pull(variable)
+
+cor_data <- ma_providers_cc %>%
+  dplyr::select(all_of(retained_cc), payment_gap) %>%
+  drop_na() %>%
+  mutate(log_payment_gap = log(payment_gap)) %>%
+  dplyr::select(-payment_gap)
+
+cor_matrix <- cor(cor_data, use = "complete.obs")
+
+corrplot(
+  cor_matrix,
+  method      = "color",
+  type        = "upper",
+  tl.cex      = 0.7,
+  tl.col      = "black",
+  addCoef.col = "black",
+  number.cex  = 0.55,
+  col         = colorRampPalette(c("#2166AC", "white", "#C8102E"))(200),
+  title       = "Correlation Matrix: Retained CC Variables & Log Payment Gap",
+  mar         = c(0, 0, 2, 0)
+)
+
+print(round(cor_matrix, 2))
+```
+
+------------------------------------------------------------------------
+
+# Part 11: save preprocessed dataset
+
+```{r p11-save}
+# Save provider-level preprocessed dataset for downstream analyses 
+saveRDS(ma_providers, "../data/processed/ma_providers_preprocessed.rds") 
+cat("Saved: ma_providers_preprocessed.rds\n")
+cat("Rows:", nrow(ma_providers), "\n") 
+cat("Columns:", ncol(ma_providers), "\n") 
+saveRDS(ma_providers_rq3, "../data/processed/ma_providers_rq3.rds")
+cat("Saved: ma_providers_rq3.rds\n")
+cat("Rows:", nrow(ma_providers_rq3), "\n") 
+cat("Columns:", ncol(ma_providers_rq3), "\n") 
+```
+
