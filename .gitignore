@@ -1,0 +1,36 @@
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# RStudio files
+.Rproj.user/
+*.Rproj
+
+# Workspace files (usually not needed in version control)
+.RData
+.Ruserdata
+
+# Package build/check artifacts
+.Rcheck/
+*.tar.gz
+
+# Compiled files
+*.o
+*.so
+*.dll
+
+# RStudio / knitr cache
+*_cache/
+*_files/
+
+# If using renv (highly recommended)
+renv/library/
+renv/staging/
+renv.lock  # (optional: some teams track this, some don’t)
+
+# macOS / system files
+.DS_Store
+
+# Windows
+Thumbs.db
